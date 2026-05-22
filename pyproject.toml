@@ -22,6 +22,14 @@ dev = [
     "nbconvert>=7.14",
     "nbformat>=5.10",
 ]
+# Two-layer criticality + compliance modeling notebook (`modeling.ipynb`).
+# Install: `uv sync --group modeling` (or `uv run --group modeling jupyter notebook`).
+modeling = [
+    "lightgbm>=4.3",
+    "shap>=0.44",
+    "torch>=2.2",
+    "torch-geometric>=2.5",
+]
 
 [tool.uv]
 package = false

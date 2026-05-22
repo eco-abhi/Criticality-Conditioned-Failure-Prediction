@@ -18,5 +18,11 @@ outputs/
 
 # OS / editor
 .DS_Store
+**/.DS_Store
+
+# Local experiment dirs under outputs/ (regenerate via scripts/tune_conditioning.py)
+outputs/sweep/
+outputs/tune/
+outputs/_smoke_*/
 *.swp
 *.swo

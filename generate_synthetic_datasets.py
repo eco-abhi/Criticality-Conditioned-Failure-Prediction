@@ -6,6 +6,24 @@ Usage:
   uv run python generate_synthetic_datasets.py
   uv run python generate_synthetic_datasets.py --plots
   uv run python generate_synthetic_datasets.py --demo   # no DataCo CSV; stub backbone only
+
+  ABC label de-confounding: **ABC_SCORE_NOISE** scales Gaussian jitter on the ABC *score* before
+  quantile cuts (`score = log(price) + 0.75*zcv + ABC_SCORE_NOISE * N(0,1)`). Increase it to thicken
+  A/B and B/C boundaries (default 0.05 reproduces the original nearly-deterministic score). Env
+  `ABC_SCORE_NOISE` or `--abc-score-noise`.
+
+  Optional **ABC_LABEL_NOISE** (post-cut uniform relabel) remains for audits; it does not fix the
+  score path the way pre-cut jitter does.
+
+  Class-conditional feature overlap: ABC_FEATURE_OVERLAP in [0, 1] linearly blends literature
+  augmentation (suppliers, lead time, stockouts, substitutability) from class-specific priors
+  toward pooled priors so A/B/C distributions overlap more (reduces label leakage through
+  augment_literature_part_features). Env ABC_FEATURE_OVERLAP or --abc-feature-overlap.
+
+  **Latent criticality mode** (`SYNTHETIC_GENERATOR_MODE=latent`): each part gets a continuous
+  `latent_criticality_score`; ABC labels and observables are **independent noisy views** of that
+  latent (no price→label→feature chain). Knobs: `LATENT_TO_LABEL_NOISE`, `LATENT_TO_FEATURE_NOISE`.
+  BOM tiers use latent tertiles; cascade BOM summaries use latent tertiles, not ABC labels.
 """
 
 from __future__ import annotations
@@ -30,7 +48,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # =============================================================================
 import hashlib
 import io
+import json
 import re
+from datetime import datetime, timezone
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -44,11 +64,27 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # -----------------------------------------------------------------------------
 # Global constants (edit for sensitivity analysis)
 # -----------------------------------------------------------------------------
-N_PARTS = 5000
+N_PARTS = int(os.environ.get("N_PARTS", "3500"))
 RANDOM_SEED = 42
 
 # ABC nominal shares (rule-based proxy classifier targets)
 A_SHARE, B_SHARE, C_SHARE = 0.20, 0.30, 0.50
+
+# Post-quantile random ABC relabel (uniform A/B/C) — breaks invertible price/CV → class mapping.
+ABC_LABEL_NOISE: float = float(os.environ.get("ABC_LABEL_NOISE", "0.0"))
+
+# Blend class-conditional literature augmentation toward pooled distributions (see module docstring).
+ABC_FEATURE_OVERLAP: float = float(os.environ.get("ABC_FEATURE_OVERLAP", "0.0"))
+
+# Scale of N(0,1) jitter on ABC score *before* quantile cuts (thickens class boundaries).
+ABC_SCORE_NOISE: float = float(os.environ.get("ABC_SCORE_NOISE", "0.05"))
+
+# --- Latent criticality generator (SYNTHETIC_GENERATOR_MODE=latent) ---
+SYNTHETIC_GENERATOR_MODE: str = os.environ.get("SYNTHETIC_GENERATOR_MODE", "latent").strip().lower()
+# Std of Gaussian noise added to latent before ABC quantile assignment (higher = blurrier A/B/C).
+LATENT_TO_LABEL_NOISE: float = float(os.environ.get("LATENT_TO_LABEL_NOISE", "0.45"))
+# Scales independent observation noise on each feature channel vs latent (higher = weaker signal).
+LATENT_TO_FEATURE_NOISE: float = float(os.environ.get("LATENT_TO_FEATURE_NOISE", "1.05"))
 
 # Lead time priors by criticality class (weeks) — synthetic augmentation
 LT_MEAN_WEEKS = {"A": 5.0, "B": 7.5, "C": 11.0}
@@ -353,37 +389,106 @@ def assign_abc_by_price_demand_cv(
     a_share: float,
     b_share: float,
     c_share: float,
+    label_noise: float | None = None,
+    score_noise: float | None = None,
 ) -> pd.DataFrame:
+    ln = float(ABC_LABEL_NOISE if label_noise is None else label_noise)
+    if not (0.0 <= ln <= 1.0):
+        raise ValueError(f"label_noise must be in [0, 1], got {ln!r}")
+    sn = float(ABC_SCORE_NOISE if score_noise is None else score_noise)
+    if sn < 0.0:
+        raise ValueError(f"score_noise must be >= 0, got {sn!r}")
+
     x = np.log1p(df[price_col].clip(lower=1e-6))
     zcv = df[cv_col].replace([np.inf, -np.inf], np.nan)
     zcv = zcv.fillna(zcv.median())
     zcv = (zcv - zcv.mean()) / (zcv.std(ddof=1) + 1e-6)
-    score = x + 0.75 * zcv + 0.05 * rng.normal(size=len(df))
+    score = x + 0.75 * zcv + sn * rng.normal(size=len(df))
     q1, q2 = np.quantile(score, [a_share, a_share + b_share])
-    cls = np.where(score <= q1, "A", np.where(score <= q2, "B", "C"))
+    cls = np.asarray(np.where(score <= q1, "A", np.where(score <= q2, "B", "C")), dtype=object)
+    if ln > 0.0:
+        flip_mask = rng.random(size=len(cls)) < ln
+        if np.any(flip_mask):
+            cls = cls.copy()
+            cls[flip_mask] = rng.choice(np.array(["A", "B", "C"], dtype=object), size=int(flip_mask.sum()))
+
     out = df.copy()
-    out["criticality_class"] = cls
+    out["criticality_class"] = cls.astype(str)
     return out
 
 
-def augment_literature_part_features(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+def _blended_literature_tables(alpha: float) -> tuple[
+    dict[str, tuple[int, int]],
+    dict[str, float],
+    dict[str, float],
+    dict[str, float],
+    dict[str, float],
+]:
+    """Linear blend (alpha in [0,1]) from class-specific constants toward pooled values."""
+    classes = ("A", "B", "C")
+    lt_mean_p = sum(LT_MEAN_WEEKS[c] for c in classes) / 3.0
+    lt_cv_p = sum(LT_CV[c] for c in classes) / 3.0
+    psub_p = sum(P_SUBSTITUTABLE[c] for c in classes) / 3.0
+    stock_p = sum(STOCKOUT_RATE_BY_CLASS[c] for c in classes) / 3.0
+    ns_lo_p, ns_hi_p = 1, 6
+
+    n_sup: dict[str, tuple[int, int]] = {}
+    p_sub: dict[str, float] = {}
+    stock_r: dict[str, float] = {}
+    lt_m: dict[str, float] = {}
+    lt_c: dict[str, float] = {}
+    for c in classes:
+        lo0, hi0 = N_SUPPLIERS_BY_CLASS[c]
+        lo1 = int(max(1, round((1.0 - alpha) * lo0 + alpha * ns_lo_p)))
+        hi1 = int(max(lo1, round((1.0 - alpha) * hi0 + alpha * ns_hi_p)))
+        n_sup[c] = (lo1, hi1)
+        p_sub[c] = (1.0 - alpha) * P_SUBSTITUTABLE[c] + alpha * psub_p
+        stock_r[c] = max(0.05, (1.0 - alpha) * STOCKOUT_RATE_BY_CLASS[c] + alpha * stock_p)
+        lt_m[c] = (1.0 - alpha) * LT_MEAN_WEEKS[c] + alpha * lt_mean_p
+        lt_c[c] = (1.0 - alpha) * LT_CV[c] + alpha * lt_cv_p
+    return n_sup, p_sub, stock_r, lt_m, lt_c
+
+
+def _lt_mean_clip_bounds(class_key: str, alpha: float) -> tuple[float, float]:
+    """Clip range for sampled lead-time mean (weeks); blend toward pooled (4, 14)."""
+    if class_key == "A":
+        lo_s, hi_s = 4.0, 6.0
+    else:
+        lo_s, hi_s = 6.0, 14.0
+    lo_p, hi_p = 4.0, 14.0
+    return (1.0 - alpha) * lo_s + alpha * lo_p, (1.0 - alpha) * hi_s + alpha * hi_p
+
+
+def augment_literature_part_features(
+    df: pd.DataFrame,
+    rng: np.random.Generator,
+    feature_overlap: float | None = None,
+) -> pd.DataFrame:
+    alpha = float(ABC_FEATURE_OVERLAP if feature_overlap is None else feature_overlap)
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"feature_overlap must be in [0, 1], got {alpha!r}")
+
+    n_sup, p_sub, stock_r, lt_m, lt_c = _blended_literature_tables(alpha)
     df = df.copy()
 
     def draw_supplier_count(row) -> int:
-        lo, hi = N_SUPPLIERS_BY_CLASS[row["criticality_class"]]
+        lo, hi = n_sup[str(row["criticality_class"])]
         return int(rng.integers(lo, hi + 1))
 
     df["n_qualified_suppliers"] = df.apply(draw_supplier_count, axis=1)
-    df["substitutable_flag"] = df["criticality_class"].map(lambda k: int(rng.random() < P_SUBSTITUTABLE[k]))
+    df["substitutable_flag"] = df["criticality_class"].map(
+        lambda k: int(rng.random() < p_sub[str(k)])
+    )
     df["stockout_events_per_year"] = df["criticality_class"].map(
-        lambda k: float(max(0.0, rng.poisson(STOCKOUT_RATE_BY_CLASS[k])))
+        lambda k: float(max(0.0, rng.poisson(stock_r[str(k)])))
     )
 
     def draw_lt(row):
-        k = row["criticality_class"]
-        mean_w = float(rng.normal(LT_MEAN_WEEKS[k], 0.35))
-        mean_w = float(np.clip(mean_w, 4.0 if k == "A" else 6.0, 6.0 if k == "A" else 14.0))
-        cv = float(rng.normal(LT_CV[k], 0.03))
+        k = str(row["criticality_class"])
+        mean_w = float(rng.normal(lt_m[k], 0.35))
+        lo_clip, hi_clip = _lt_mean_clip_bounds(k, alpha)
+        mean_w = float(np.clip(mean_w, lo_clip, hi_clip))
+        cv = float(rng.normal(lt_c[k], 0.03))
         cv = float(np.clip(cv, 0.15, 0.35))
         sigma_w = max(1e-3, cv * mean_w)
         return mean_w, cv, sigma_w
@@ -400,12 +505,89 @@ def augment_literature_part_features(df: pd.DataFrame, rng: np.random.Generator)
     return df
 
 
+def sample_latent_criticality(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Standard normal latent scores (one per part row)."""
+    return rng.normal(0.0, 1.0, size=int(n))
+
+
+def assign_abc_labels_from_latent(
+    latent: np.ndarray,
+    label_noise_std: float,
+    rng: np.random.Generator,
+    a_share: float,
+    b_share: float,
+    c_share: float,
+) -> np.ndarray:
+    """Noisy quantile cut on latent: ABC is a coarsened, noisy function of the same latent."""
+    noisy = latent + float(label_noise_std) * rng.normal(size=len(latent))
+    q1, q2 = np.quantile(noisy, [a_share, a_share + b_share])
+    cls = np.asarray(np.where(noisy <= q1, "A", np.where(noisy <= q2, "B", "C")), dtype=str)
+    return cls
+
+
+def apply_latent_observed_features(
+    df: pd.DataFrame,
+    latent: np.ndarray,
+    feature_noise_scale: float,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Independent noisy observables of latent (same column names as legacy augmentation)."""
+    out = df.copy()
+    fe = float(feature_noise_scale)
+    n = len(out)
+    lat = np.asarray(latent, dtype=float)
+    out["latent_criticality_score"] = lat.astype(float)
+    out["abc_price_proxy"] = np.clip(np.exp(0.6 * lat + fe * rng.normal(size=n)), 1e-6, None).astype(float)
+    out["abc_demand_cv_proxy"] = np.clip(
+        0.35 + 0.45 * lat + fe * 0.35 * rng.normal(size=n),
+        0.12,
+        3.0,
+    ).astype(float)
+    lt_mean = np.clip(np.exp(-0.35 * lat + fe * rng.normal(size=n)), 4.0, 14.0).astype(float)
+    out["lead_time_mean_weeks"] = lt_mean
+    out["lead_time_cv"] = np.clip(
+        0.22 + 0.05 * np.tanh(lat) + fe * 0.035 * rng.normal(size=n),
+        0.15,
+        0.35,
+    ).astype(float)
+    out["lead_time_sigma_weeks"] = np.clip(out["lead_time_cv"] * out["lead_time_mean_weeks"], 1e-3, None).astype(
+        float
+    )
+    lam = np.clip(3.4 - 0.75 * lat + fe * 0.5 * rng.normal(size=n), 0.6, 10.0)
+    ns = rng.poisson(lam).astype(int)
+    out["n_qualified_suppliers"] = np.clip(ns, 1, 6).astype(int)
+    logit = np.clip(-0.5 + 0.55 * lat + fe * 0.4 * rng.normal(size=n), -6.0, 6.0)
+    p_sub = 1.0 / (1.0 + np.exp(-logit))
+    out["substitutable_flag"] = rng.binomial(1, p_sub).astype(int)
+    span = float(np.ptp(lat)) + 1e-9
+    stock_mu = np.clip(
+        0.4 + 0.45 * (lat - lat.min()) / span + fe * 0.25 * rng.normal(size=n),
+        0.08,
+        5.0,
+    )
+    out["stockout_events_per_year"] = rng.poisson(np.maximum(stock_mu, 1e-3)).astype(float)
+
+    out["lead_time_source"] = "synthetic_latent_generator"
+    out["supplier_count_source"] = "synthetic_latent_generator"
+    out["substitutability_source"] = "synthetic_latent_generator"
+    out["stockout_source"] = "synthetic_latent_generator"
+    return out
+
+
 def build_unified_part_catalog(
     dataco: pd.DataFrame,
     uci: pd.DataFrame,
     n_target: int,
     rng: np.random.Generator,
+    abc_label_noise: float | None = None,
+    abc_feature_overlap: float | None = None,
+    abc_score_noise: float | None = None,
+    generator_mode: str | None = None,
 ) -> pd.DataFrame:
+    mode = (generator_mode or SYNTHETIC_GENERATOR_MODE).strip().lower()
+    if mode not in ("legacy", "latent"):
+        raise ValueError(f"Unknown generator mode {mode!r}; use 'legacy' or 'latent' (env SYNTHETIC_GENERATOR_MODE).")
+
     uci_stats = build_uci_sku_stats(uci)
     dataco_stats = build_dataco_product_stats(dataco)
 
@@ -449,15 +631,25 @@ def build_unified_part_catalog(
     both["dedup_key"] = both["display_name"].astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
     both = both.drop_duplicates(subset=["dedup_key"], keep="first").reset_index(drop=True)
 
-    price = both["uci_median_unit_price"].fillna(
-        both["dataco_median_line_sales"].fillna(0.0) / (both["dataco_mean_order_qty"].fillna(1.0) + 1.0)
-    )
-    cv = both["uci_demand_cv_monthly"].fillna(0.35)
-
-    both["abc_price_proxy"] = price.clip(lower=1e-6)
-    both["abc_demand_cv_proxy"] = cv
-
-    both = assign_abc_by_price_demand_cv(both, "abc_price_proxy", "abc_demand_cv_proxy", rng, A_SHARE, B_SHARE, C_SHARE)
+    eff_noise = float(ABC_LABEL_NOISE if abc_label_noise is None else abc_label_noise)
+    if mode == "legacy":
+        price = both["uci_median_unit_price"].fillna(
+            both["dataco_median_line_sales"].fillna(0.0) / (both["dataco_mean_order_qty"].fillna(1.0) + 1.0)
+        )
+        cv = both["uci_demand_cv_monthly"].fillna(0.35)
+        both["abc_price_proxy"] = price.clip(lower=1e-6)
+        both["abc_demand_cv_proxy"] = cv
+        both = assign_abc_by_price_demand_cv(
+            both,
+            "abc_price_proxy",
+            "abc_demand_cv_proxy",
+            rng,
+            A_SHARE,
+            B_SHARE,
+            C_SHARE,
+            label_noise=abc_label_noise,
+            score_noise=abc_score_noise,
+        )
 
     if len(both) >= n_target:
         both = both.sample(n=n_target, random_state=int(rng.integers(1_000_000))).reset_index(drop=True)
@@ -490,15 +682,37 @@ def build_unified_part_catalog(
     both = both.reset_index(drop=True)
     both["part_id"] = _assign_part_ids_with_collision_suffix(both["namespace"], both["dedup_key"])
 
-    both = augment_literature_part_features(both, rng)
+    if mode == "legacy":
+        both = augment_literature_part_features(both, rng, feature_overlap=abc_feature_overlap)
+    else:
+        latent_v = sample_latent_criticality(len(both), rng)
+        cls = assign_abc_labels_from_latent(
+            latent_v,
+            LATENT_TO_LABEL_NOISE,
+            rng,
+            A_SHARE,
+            B_SHARE,
+            C_SHARE,
+        )
+        both["criticality_class"] = cls
+        both = apply_latent_observed_features(both, latent_v, LATENT_TO_FEATURE_NOISE, rng)
 
     if not both["part_id"].is_unique:
         raise AssertionError("Internal error: part_id must be unique after catalog build.")
 
     shares = both["criticality_class"].value_counts(normalize=True)
-    assert abs(float(shares.get("A", 0.0)) - A_SHARE) < 0.03
-    assert abs(float(shares.get("B", 0.0)) - B_SHARE) < 0.04
-    assert abs(float(shares.get("C", 0.0)) - C_SHARE) < 0.06
+    if mode == "latent":
+        assert set(both["criticality_class"].astype(str).unique()) == {"A", "B", "C"}
+        assert (both["criticality_class"].value_counts() >= 1).all()
+        for lab, target, tol in (("A", A_SHARE, 0.12), ("B", B_SHARE, 0.12), ("C", C_SHARE, 0.15)):
+            assert abs(float(shares.get(lab, 0.0)) - target) < tol, (shares.to_dict(), lab)
+    elif eff_noise < 1e-12:
+        assert abs(float(shares.get("A", 0.0)) - A_SHARE) < 0.03
+        assert abs(float(shares.get("B", 0.0)) - B_SHARE) < 0.04
+        assert abs(float(shares.get("C", 0.0)) - C_SHARE) < 0.06
+    else:
+        assert set(both["criticality_class"].astype(str).unique()) == {"A", "B", "C"}
+        assert (both["criticality_class"].value_counts() >= 1).all()
 
     assert both["lead_time_cv"].between(0.15, 0.35).mean() > 0.90
     assert both["n_qualified_suppliers"].between(1, 6).all()
@@ -644,6 +858,14 @@ def generate_compliance_outcomes(
     cascade = cascade.fillna(float(cascade.median()))
     cascade = (cascade - cascade.mean()) / (float(cascade.std(ddof=1)) + 1e-6)
 
+    otd = df["otd_oem_measured"].astype(float)
+    otd = otd.fillna(float(otd.median()))
+    otd = (otd - otd.mean()) / (float(otd.std(ddof=1)) + 1e-6)
+
+    resch = df["reschedule_burden_pp"].astype(float)
+    resch = resch.fillna(float(resch.median()))
+    resch = (resch - resch.mean()) / (float(resch.std(ddof=1)) + 1e-6)
+
     z_crit = _cls_onehot(df["criticality_class"])
     z = pd.concat(
         [
@@ -651,11 +873,14 @@ def generate_compliance_outcomes(
             pd.Series(df["supplier_at_risk_flag"].astype(float), name="at_risk"),
             lt_cv.rename("lt_cv"),
             cascade.rename("cascade"),
+            otd.rename("otd"),
+            resch.rename("resch"),
         ],
         axis=1,
     )
 
-    beta = np.array([-0.55, 0.10, 0.35, 0.65, 0.90, 0.25])
+    # crit_A,B,C | at_risk | lt_cv | cascade | otd (lower OTD -> higher risk) | reschedule burden
+    beta = np.array([-0.55, 0.10, 0.35, 0.65, 0.90, 0.25, -0.55, 0.45])
     xb = z.to_numpy(dtype=float) @ beta
     if not np.isfinite(xb).all():
         raise ValueError("Non-finite linear predictor in compliance model; check merged features.")
@@ -719,13 +944,8 @@ def add_rolling_supplier_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def engineer_final_matrix(part_catalog: pd.DataFrame, panel_roll: pd.DataFrame) -> pd.DataFrame:
-    df = panel_roll.merge(part_catalog, on="part_id", how="left", suffixes=("", "_part"))
-
-    for c in ["A", "B", "C"]:
-        df[f"is_{c}"] = (df["criticality_class"] == c).astype(int)
-        df[f"is_{c}_x_at_risk"] = df[f"is_{c}"] * df["supplier_at_risk_flag"].astype(int)
-
-    return df
+    """Merge part catalog onto the supplier panel (no true-class interaction columns)."""
+    return panel_roll.merge(part_catalog, on="part_id", how="left", suffixes=("", "_part"))
 
 
 # =============================================================================
@@ -864,6 +1084,23 @@ def run_eda(part_catalog, compliance, supplier_panel, fig_dir: Path) -> None:
     save()
 
 
+def write_run_manifest(out_dir: Path) -> None:
+    """Write generator configuration for reproducibility (always; overwrites each run)."""
+    payload: Dict[str, object] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "random_seed": int(RANDOM_SEED),
+        "n_parts": int(N_PARTS),
+        "synthetic_generator_mode": SYNTHETIC_GENERATOR_MODE,
+        "abc_label_noise": float(ABC_LABEL_NOISE),
+        "abc_feature_overlap": float(ABC_FEATURE_OVERLAP),
+        "abc_score_noise": float(ABC_SCORE_NOISE),
+    }
+    if SYNTHETIC_GENERATOR_MODE == "latent":
+        payload["latent_to_label_noise"] = float(LATENT_TO_LABEL_NOISE)
+        payload["latent_to_feature_noise"] = float(LATENT_TO_FEATURE_NOISE)
+    (out_dir / "run_manifest.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def export_artifacts(part_catalog, supplier_panel_fe, compliance, bom_graph, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     part_out = part_catalog.drop(columns=[c for c in ["dedup_key"] if c in part_catalog.columns], errors="ignore")
@@ -905,7 +1142,8 @@ def print_summary(part_catalog) -> None:
 
 
 def main() -> None:
-    global OUT_DIR, rng
+    global OUT_DIR, rng, ABC_LABEL_NOISE, ABC_FEATURE_OVERLAP, ABC_SCORE_NOISE
+    global SYNTHETIC_GENERATOR_MODE, LATENT_TO_LABEL_NOISE, LATENT_TO_FEATURE_NOISE
     parser = argparse.ArgumentParser(description="Generate hybrid synthetic dataset (DataCo + UCI backbone).")
     parser.add_argument("--output-dir", type=Path, default=None, help="Export directory (default: <repo>/outputs)")
     parser.add_argument("--plots", action="store_true", help="Write EDA PNGs to <output-dir>/figures")
@@ -915,6 +1153,54 @@ def main() -> None:
         action="store_true",
         help="Use in-memory DataCo-shaped stub instead of data/DataCoSupplyChainDataset.csv (smoke test only).",
     )
+    parser.add_argument(
+        "--abc-label-noise",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Probability each part's ABC label is replaced with uniform A/B/C after quantile ABC (0–1). "
+        "Overrides ABC_LABEL_NOISE env for this run.",
+    )
+    parser.add_argument(
+        "--abc-feature-overlap",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Blend literature augmentation (suppliers, lead times, stockouts, substitutability) from "
+        "class-specific priors toward pooled priors (0–1). Overrides ABC_FEATURE_OVERLAP env.",
+    )
+    parser.add_argument(
+        "--abc-score-noise",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Multiplier on N(0,1) jitter in ABC score before quantile assignment (>=0). "
+        "Overrides ABC_SCORE_NOISE env.",
+    )
+    parser.add_argument(
+        "--generator-mode",
+        type=str,
+        choices=["legacy", "latent"],
+        default=None,
+        help="Synthetic catalog: 'legacy' (price/CV ABC + class-conditional augmentation) or "
+        "'latent' (latent score drives labels and observables). Overrides SYNTHETIC_GENERATOR_MODE env.",
+    )
+    parser.add_argument(
+        "--latent-label-noise",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Std of Gaussian noise on latent before ABC quantile cut (latent mode only). "
+        "Overrides LATENT_TO_LABEL_NOISE env.",
+    )
+    parser.add_argument(
+        "--latent-feature-noise",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Scales observation noise on latent-derived part features (latent mode only). "
+        "Overrides LATENT_TO_FEATURE_NOISE env.",
+    )
     args = parser.parse_args()
 
     os.chdir(ROOT)
@@ -922,6 +1208,18 @@ def main() -> None:
     globals()["OUT_DIR"] = out_dir
     if args.n_parts is not None:
         globals()["N_PARTS"] = args.n_parts
+    if args.abc_label_noise is not None:
+        ABC_LABEL_NOISE = float(args.abc_label_noise)
+    if args.abc_feature_overlap is not None:
+        ABC_FEATURE_OVERLAP = float(args.abc_feature_overlap)
+    if args.abc_score_noise is not None:
+        ABC_SCORE_NOISE = float(args.abc_score_noise)
+    if args.generator_mode is not None:
+        SYNTHETIC_GENERATOR_MODE = str(args.generator_mode).strip().lower()
+    if args.latent_label_noise is not None:
+        LATENT_TO_LABEL_NOISE = float(args.latent_label_noise)
+    if args.latent_feature_noise is not None:
+        LATENT_TO_FEATURE_NOISE = float(args.latent_feature_noise)
 
     np.random.seed(RANDOM_SEED)
     globals()["rng"] = np.random.default_rng(RANDOM_SEED)
@@ -934,6 +1232,13 @@ def main() -> None:
     plt.rcParams["figure.figsize"] = (10, 5)
 
     print("OUT_DIR =", OUT_DIR)
+    print("SYNTHETIC_GENERATOR_MODE =", SYNTHETIC_GENERATOR_MODE)
+    print("ABC_LABEL_NOISE =", ABC_LABEL_NOISE)
+    print("ABC_FEATURE_OVERLAP =", ABC_FEATURE_OVERLAP)
+    print("ABC_SCORE_NOISE =", ABC_SCORE_NOISE)
+    if SYNTHETIC_GENERATOR_MODE == "latent":
+        print("LATENT_TO_LABEL_NOISE =", LATENT_TO_LABEL_NOISE)
+        print("LATENT_TO_FEATURE_NOISE =", LATENT_TO_FEATURE_NOISE)
     if args.demo:
         print("WARNING: --demo uses a synthetic DataCo stub, not the public DataCo dataset.")
         dataco_raw = make_demo_dataco_stub(rng)
@@ -956,6 +1261,11 @@ def main() -> None:
     print("[BOM] loaded from", ROOT / "bom_graph.py")
 
     crit_series = part_catalog.set_index("part_id")["criticality_class"]
+    latent_series = None
+    latent_dict = None
+    if SYNTHETIC_GENERATOR_MODE == "latent" and "latent_criticality_score" in part_catalog.columns:
+        latent_series = part_catalog.set_index("part_id")["latent_criticality_score"].astype(float)
+        latent_dict = latent_series.to_dict()
     bom_graph = generate_bom_dag(
         part_ids=part_catalog["part_id"].tolist(),
         depth_min=BOM_DEPTH_MIN,
@@ -964,8 +1274,9 @@ def main() -> None:
         fanout_max=BOM_FANOUT_MAX,
         criticality=crit_series,
         rng=rng,
+        latent=latent_series,
     )
-    bom_features = compute_bom_position_features(bom_graph, crit_series.to_dict())
+    bom_features = compute_bom_position_features(bom_graph, crit_series.to_dict(), latent_by_part=latent_dict)
     part_catalog = part_catalog.set_index("part_id").join(bom_features, how="left").reset_index()
     assert part_catalog["bom_in_degree"].between(0, 500).all()
     assert float(part_catalog["bom_in_degree"].mean()) > 1.0
@@ -985,6 +1296,7 @@ def main() -> None:
         run_eda(part_catalog, compliance, supplier_panel, OUT_DIR / "figures")
 
     export_artifacts(part_catalog, supplier_panel_fe, compliance, bom_graph, OUT_DIR)
+    write_run_manifest(OUT_DIR)
     print_summary(part_catalog)
 
 

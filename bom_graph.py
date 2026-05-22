@@ -14,7 +14,7 @@ Algorithm
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import networkx as nx
 import numpy as np
@@ -29,6 +29,7 @@ def generate_bom_dag(
     fanout_max: int,
     criticality: pd.Series,
     rng: np.random.Generator,
+    latent: Optional[pd.Series] = None,
 ) -> nx.DiGraph:
     """
     Build a tiered DAG where edges run component -> assembly.
@@ -40,8 +41,11 @@ def generate_bom_dag(
     depth_max  : maximum number of BOM tiers.
     fanout_min : minimum components consumed per assembly node.
     fanout_max : maximum components consumed per assembly node.
-    criticality: pd.Series indexed by part_id with values in {A, B, C}.
+    criticality: pd.Series indexed by part_id with values in {A, B, C} (stored on nodes; labels).
     rng        : numpy Generator for reproducibility.
+    latent     : optional continuous score per part_id; when provided, **tier placement** uses
+                 latent tertiles mapped to low/mid/high tier biases (same machinery as A/B/C),
+                 so graph topology is driven by latent similarity to tier, not by ABC class.
 
     Returns
     -------
@@ -64,8 +68,25 @@ def generate_bom_dag(
         "C": _tier_weights(n_tiers, bias="low"),
     }
 
+    latent_tier_key: Dict[str, str] = {}
+    if latent is not None:
+        lv = np.array([float(latent.get(pid, np.nan)) for pid in part_ids], dtype=float)
+        if not np.isfinite(lv).all():
+            raise ValueError("latent series has non-finite values for BOM generation")
+        q1, q2 = np.quantile(lv, [1.0 / 3.0, 2.0 / 3.0])
+        for pid, v in zip(part_ids, lv):
+            if v <= q1:
+                latent_tier_key[pid] = "C"
+            elif v <= q2:
+                latent_tier_key[pid] = "B"
+            else:
+                latent_tier_key[pid] = "A"
+
     for pid in part_ids:
-        cls = crit_dict.get(pid, "C")
+        if latent is not None:
+            cls = latent_tier_key.get(pid, "C")
+        else:
+            cls = crit_dict.get(pid, "C")
         probs = tier_probs[cls]
         tier_of[pid] = int(rng.choice(n_tiers, p=probs))
 
@@ -168,6 +189,7 @@ def generate_bom_dag(
 def compute_bom_position_features(
     G: nx.DiGraph,
     crit_dict: Dict[str, str],
+    latent_by_part: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
     Compute per-node BOM position features.
@@ -179,9 +201,35 @@ def compute_bom_position_features(
     bom_longest_downstream_path     : longest path from this node to any root assembly.
     bom_n_downstream_A_assemblies   : count of A-class nodes reachable downstream.
     bom_criticality_propagation_score : weighted cascade exposure score.
+    latent_by_part : optional latent scores; when set, cascade weights and the downstream
+        ``bom_n_downstream_A_assemblies`` counter use **latent tertiles** (high-latent ≡ top third),
+        not ABC labels, so BOM summaries are not pure functions of ``criticality_class``.
     """
     weight = {"A": 3.0, "B": 1.5, "C": 0.5}
     topo = list(nx.topological_sort(G))
+
+    lat_vals: Dict[str, float] = {}
+    q33 = 0.0
+    q66 = 0.0
+    if latent_by_part is not None:
+        lat_vals = {n: float(latent_by_part.get(n, 0.0)) for n in G.nodes()}
+        arr = np.array(list(lat_vals.values()), dtype=float)
+        q33, q66 = (float(x) for x in np.quantile(arr, [1.0 / 3.0, 2.0 / 3.0]))
+
+    def _node_weight(node: str) -> float:
+        if latent_by_part is not None:
+            v = lat_vals[node]
+            if v <= q33:
+                return 0.5
+            if v <= q66:
+                return 1.5
+            return 3.0
+        return weight.get(crit_dict.get(node, "C"), 0.5)
+
+    def _node_is_high_signal(node: str) -> int:
+        if latent_by_part is not None:
+            return int(lat_vals[node] >= q66)
+        return int(crit_dict.get(node, "C") == "A")
 
     # Initialize per-node accumulators
     longest = {n: 0 for n in G.nodes()}
@@ -190,8 +238,8 @@ def compute_bom_position_features(
 
     # Single forward pass in topological order
     for node in topo:
-        node_weight = weight.get(crit_dict.get(node, "C"), 0.5)
-        node_is_A = int(crit_dict.get(node, "C") == "A")
+        node_weight = _node_weight(node)
+        node_is_A = _node_is_high_signal(node)
         for successor in G.successors(node):
             # Propagate longest path
             if longest[node] + 1 > longest[successor]:

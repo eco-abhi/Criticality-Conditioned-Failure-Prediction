@@ -60,6 +60,32 @@ Written to **`outputs/`** (gitignored by default):
 | `bom_graph.gpickle` | NetworkX BOM DAG (edges: component → assembly) |
 | `data_dictionary.md` | Column provenance (public vs synthetic) |
 
+## Modeling (Layer 1 + Layer 2)
+
+Install modeling dependencies:
+
+```bash
+uv sync --group modeling
+```
+
+**Reproduce tuned paper run** (see [REPRODUCE.md](REPRODUCE.md) for details):
+
+```bash
+uv run python scripts/reproduce_paper.py
+```
+
+Or run steps manually with defaults: **3500 parts**, **latent** generator (`LLN=0.45`, `LFN=1.05`), **`LAYER1_FEATURES=clean`**, **`COMPLIANCE_GRAIN=part_month`**, **`CRIT_PROB_SHARPEN=0.88`**.
+
+| Script / notebook | Role |
+|-------------------|------|
+| `modeling.ipynb` | Full evaluation + figures (nbconvert or Jupyter) |
+| `modeling_lib.py` | Shared training/evaluation helpers |
+| `scripts/run_modeling_core.py` | Headless pipeline (tables + JSON) |
+| `scripts/tune_conditioning.py` | Grid search for latent noise + sharpen |
+| `_build_modeling_nb.py` | Regenerate `modeling.ipynb` from source |
+
+Key outputs under `outputs/modeling/`: `classification_comparison.csv`, `full_results_summary_layer1.csv`, `compliance_comparison.csv`, `compliance_comparison_val_threshold.csv`, `compliance_comparison_business_thresholds.csv`, `business_value_simulation.csv`, `modeling_manifest.json`.
+
 ## Other scripts
 
 - **`bom_graph.py`** — Tiered BOM DAG generation and position features (loaded by the CLI via `importlib`).
