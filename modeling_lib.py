@@ -15,7 +15,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -695,6 +695,116 @@ def metrics_by_criticality(
     return by
 
 
+def bootstrap_part_level_metric_diff(
+    part_ids: np.ndarray,
+    y_true: np.ndarray,
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_boot: int = 2000,
+    random_state: int = 0,
+) -> Dict[str, float]:
+    """
+    Part-level (cluster) bootstrap for metric_fn(y, scores_b) - metric_fn(y, scores_a) on the SAME
+    test set (paired comparison; both scores evaluated on identical resamples each iteration).
+
+    Resamples PARTS with replacement, not individual rows -- rows sharing a part_id (part-month
+    panel structure) are not independent, so a naive row-level bootstrap would understate variance.
+    A part sampled twice contributes all of its rows twice.
+
+    Iterations where the resample has no positives or no negatives (metric_fn raises) are dropped;
+    this can happen at very small N and is reported via n_boot_valid vs n_boot_requested.
+
+    Returns point estimates, the observed difference, a percentile 95% CI on the difference, and a
+    two-sided bootstrap p-value (2x the smaller tail probability of crossing zero, capped at 1).
+    """
+    rng = np.random.default_rng(random_state)
+    part_ids = np.asarray(part_ids)
+    unique_parts = np.unique(part_ids)
+    n_parts = len(unique_parts)
+    part_to_rowidx = {p: np.where(part_ids == p)[0] for p in unique_parts}
+
+    point_a = float(metric_fn(y_true, scores_a))
+    point_b = float(metric_fn(y_true, scores_b))
+
+    diffs: List[float] = []
+    for _ in range(n_boot):
+        sampled_parts = rng.choice(unique_parts, size=n_parts, replace=True)
+        idx = np.concatenate([part_to_rowidx[p] for p in sampled_parts])
+        yt = y_true[idx]
+        try:
+            a = float(metric_fn(yt, scores_a[idx]))
+            b = float(metric_fn(yt, scores_b[idx]))
+        except (ValueError, ZeroDivisionError):
+            continue
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        diffs.append(b - a)
+
+    diffs_arr = np.asarray(diffs, dtype=float)
+    if len(diffs_arr) < max(50, n_boot // 4):
+        raise ValueError(
+            f"Too few valid bootstrap iterations ({len(diffs_arr)}/{n_boot}) -- metric is "
+            "undefined on most resamples at this N; CI would not be trustworthy."
+        )
+    ci_low, ci_high = np.percentile(diffs_arr, [2.5, 97.5])
+    p_low = float((diffs_arr <= 0.0).mean())
+    p_high = float((diffs_arr >= 0.0).mean())
+    p_two_sided = float(min(1.0, 2.0 * min(p_low, p_high)))
+
+    return {
+        "point_a": point_a,
+        "point_b": point_b,
+        "point_diff": point_b - point_a,
+        "ci_low": float(ci_low),
+        "ci_high": float(ci_high),
+        "p_value_two_sided": p_two_sided,
+        "n_boot_valid": int(len(diffs_arr)),
+        "n_boot_requested": int(n_boot),
+    }
+
+
+def bootstrap_layer2_comparisons(
+    df_test: pd.DataFrame,
+    y_te: np.ndarray,
+    scores: Mapping[str, np.ndarray],
+    n_boot: int = 2000,
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """
+    Part-level bootstrap CIs for the three pairwise Layer 2 comparisons (conditioned vs uniform,
+    oracle vs uniform, oracle vs conditioned) across auc_pr, brier, and f1@0.5. ``scores`` maps
+    {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te}.
+
+    Metric direction: higher auc_pr and f1 are better; LOWER brier is better, so a negative
+    point_diff for brier means the second model in the pair improved on the first (fewer errors).
+    """
+    part_ids = df_test["part_id"].astype(str).to_numpy()
+    metric_fns: Dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+        "auc_pr": lambda y, s: average_precision_score(y, s),
+        "brier": lambda y, s: brier_score_loss(y, s),
+        "f1_at_0.5": lambda y, s: f1_score(y, (np.asarray(s) >= 0.5).astype(int), zero_division=0),
+    }
+    pairs = [("conditioned", "uniform"), ("oracle", "uniform"), ("oracle", "conditioned")]
+    rows: List[Dict[str, Any]] = []
+    for b_name, a_name in pairs:
+        for metric_name, fn in metric_fns.items():
+            try:
+                res = bootstrap_part_level_metric_diff(
+                    part_ids, y_te, scores[a_name], scores[b_name], fn, n_boot=n_boot, random_state=random_state
+                )
+            except ValueError as e:
+                res = {"error": str(e)}
+            rows.append(
+                {
+                    "comparison": f"{b_name}_vs_{a_name}",
+                    "metric": metric_name,
+                    **res,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def save_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
@@ -1192,6 +1302,16 @@ def run_layer2_evaluation(
     )
     pd.DataFrame(biz_rows).to_csv(out_dir / "compliance_comparison_business_thresholds.csv", index=False)
 
+    n_boot = int(os.environ.get("L2_BOOTSTRAP_N", "2000"))
+    boot_df = bootstrap_layer2_comparisons(
+        df_test,
+        y_te,
+        {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te},
+        n_boot=n_boot,
+        random_state=0,
+    )
+    boot_df.to_csv(out_dir / "compliance_comparison_bootstrap.csv", index=False)
+
     cost_by = {
         "A": float(os.environ.get("COST_A", "50000")),
         "B": float(os.environ.get("COST_B", "10000")),
@@ -1228,11 +1348,16 @@ def run_layer2_evaluation(
     }
     save_json(out_dir / "modeling_manifest.json", manifest)
 
+    cond_vs_uni_auc_pr = boot_df[(boot_df["comparison"] == "conditioned_vs_uniform") & (boot_df["metric"] == "auc_pr")]
+    boot_summary = cond_vs_uni_auc_pr.iloc[0].to_dict() if len(cond_vs_uni_auc_pr) else {}
+
     return {
         "uniform_auc_pr": m_uni["auc_pr"],
         "conditioned_auc_pr": m_cond["auc_pr"],
         "oracle_auc_pr": m_orac["auc_pr"],
         "delta_auc_pr_cond_minus_uniform": m_cond["auc_pr"] - m_uni["auc_pr"],
+        "delta_auc_pr_cond_minus_uniform_ci95": [boot_summary.get("ci_low"), boot_summary.get("ci_high")],
+        "delta_auc_pr_cond_minus_uniform_p_value": boot_summary.get("p_value_two_sided"),
         "uniform_brier": m_uni["brier"],
         "conditioned_brier": m_cond["brier"],
         "y_test": y_te,
