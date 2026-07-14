@@ -1099,7 +1099,19 @@ def write_data_dictionary(
         "supplier-proxies draw from the upper half of the literature band) rather than independent random "
         "noise.\n"
     )
-    lines.append("- Compliance rate band: operations management / quality performance benchmarking discourse (**calibrated synthetic outcome**).\n")
+    lines.append(
+        "- Compliance rate band: operations management / quality performance benchmarking discourse "
+        "(**calibrated synthetic outcome**). We investigated CPSC/NHTSA recalls as a real substitute "
+        "for `compliance_failure` and found this is not possible: recall data gives counts, not rates "
+        "(no real population denominator links a specific recalled product to this dataset's parts or "
+        "to DataCo's/UCI's sold volumes), so any conversion to a rate would itself be invented. Real "
+        "CPSC data (saferproducts.gov, 2015-2025) is instead used as a **face-validity scale check** "
+        "(not a row-level label) via `scripts/check_recall_benchmark.py`: ~294 recalls/year across the "
+        "entire US consumer market vs. this dataset's 8%/part-month calibrated rate confirms "
+        "`compliance_failure` is intentionally modeling a different, higher-frequency, lower-severity "
+        "phenomenon (routine operational/quality/delivery compliance) than product-safety recalls, not "
+        "attempting to replicate the recall rate itself. See `outputs/compliance_benchmark_cpsc.md`.\n"
+    )
     lines.append(
         "- `real_category_link`: UCI Online Retail (household/gift SKUs) and DataCo (sporting "
         "goods/apparel/electronics retailer) do not share a category vocabulary. A TF-IDF cosine "

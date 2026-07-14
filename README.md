@@ -92,6 +92,7 @@ Key outputs under `outputs/modeling/`: `classification_comparison.csv`, `full_re
 - **`visualize_bom_graph.py`** — Histogram + tiered subgraph PNGs (`bom_graph_visualization_v2.png`, `bom_subgraph_tiered.png`) from `outputs/bom_graph.gpickle` and `outputs/part_catalog.csv`.
 - **`data_tests.py`** — Quick sanity prints on exported CSVs and the BOM graph.
 - **`_build_synthetic_notebook.py`** — Regenerates `synthetic_data_generator.ipynb` if you keep the notebook path in sync with the pipeline.
+- **`scripts/check_recall_benchmark.py`** — Optional, network-dependent: fetches real CPSC recall data (saferproducts.gov) as a face-validity scale check on `compliance_failure`'s calibrated rate (not a row-level real label — recall data gives counts, not rates; see the script's docstring and `data_dictionary.md`). Not run as part of the main pipeline. Writes `outputs/compliance_benchmark_cpsc.md`.
 
 ## License / data use
 
