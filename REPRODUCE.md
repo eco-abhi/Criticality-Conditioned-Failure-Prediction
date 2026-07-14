@@ -15,7 +15,7 @@ uv sync --group modeling   # LightGBM, PyTorch, PyG, SHAP
 
 ## Tuned configuration (frozen for the paper)
 
-These values were chosen so Layer 2 **conditioned** beats **uniform** on AUC-PR while keeping Layer 1 in an honest evaluation band (price rule macro F1 ≈ 0.45–0.55).
+These values were originally chosen via `scripts/tune_conditioning.py` so Layer 2 **conditioned** beats **uniform** on AUC-PR, while keeping Layer 1 in an honest evaluation band (price rule macro F1 ≈ 0.45–0.55). **This is a data-generating-process search, not a hyperparameter search** — be explicit about that in the paper. Bootstrap significance testing (added after tuning; see "What to report" below) shows the searched-for effect is narrower than the tuning objective implies: conditioning improves Brier (calibration) significantly only at `LAYER2_SCOPE=all`, not AUC-PR/F1, and nothing reaches significance at the honestly-scoped `real_category_only` N. Report the tuning process itself as a limitation, not just the config table.
 
 | Setting | Value | Meaning |
 |---------|-------|---------|
@@ -83,21 +83,28 @@ uv run --group dev --group modeling jupyter nbconvert \
 | File | Content |
 |------|---------|
 | `outputs/modeling/classification_comparison.csv` | Layer 1: weighted/macro F1 + per-class A/B/C |
+| `outputs/modeling/classification_comparison_bootstrap.csv` | Layer 1: part-level bootstrap 95% CI + p-value for each pairwise macro-F1 comparison |
 | `outputs/modeling/full_results_summary_layer1.csv` | Same as classification_comparison |
 | `outputs/modeling/compliance_comparison.csv` | Layer 2 @ threshold 0.5 |
+| `outputs/modeling/compliance_comparison_bootstrap.csv` | Layer 2: part-level bootstrap 95% CI + p-value for each pairwise comparison × {auc_pr, brier, f1@0.5} |
 | `outputs/modeling/compliance_comparison_val_threshold.csv` | Threshold tuned on validation (0.05–0.50 search) |
 | `outputs/modeling/compliance_comparison_business_thresholds.csv` | P/R/F1 at 0.10–0.25 |
 | `outputs/modeling/business_value_simulation.csv` | Net value vs threshold |
 | `outputs/modeling/modeling_manifest.json` | Layer 2 grain, sharpen, row counts |
 | `outputs/modeling/layer2_*.json` | Per-model detail + by-class metrics |
 
+Bootstrap CIs are part-level cluster bootstraps (`n_boot=2000` default, override via `L2_BOOTSTRAP_N`), not row-level — rows sharing a `part_id` in the part-month panel aren't independent, so row-level resampling would understate variance. See `modeling_lib.bootstrap_part_level_metric_diff`.
+
 ## What to report in the paper
 
-- **Layer 1:** Macro F1 for price rule → tabular LGBM → LGBM+GAT.
-- **Layer 2:** AUC-PR and Brier at 0.5; conditioned vs uniform vs oracle.
-- **Caveat:** Conditioning gain is **modest**; oracle shows headroom if criticality were perfect.
+**Do not report point estimates alone — every headline comparison below has a bootstrap CI/p-value; report those, not just the deltas.**
+
+- **Layer 1** (`classification_comparison_bootstrap.csv`): tabular LGBM and LGBM+GAT both significantly beat the price-rule baseline (p≈0.007, p≈0.001 in the reference run). **LGBM+GAT vs. plain tabular LGBM is NOT significant** (p≈0.74) — the graph/GAT component's added complexity is not currently earning a statistically detectable improvement over the simpler tabular-only model. State this explicitly if the paper's contribution leans on the graph architecture.
+- **Layer 2** (`compliance_comparison_bootstrap.csv`): at `LAYER2_SCOPE=real_category_only` (the honestly-scoped, real-category-linked subset), **no conditioned-vs-uniform or oracle-vs-uniform comparison reaches p<0.05** — this N is underpowered to confirm the effect. At `LAYER2_SCOPE=all` (full catalog, most supplier links are category-blind proxies), conditioned significantly beats uniform **on Brier only** (p≈0.025), not AUC-PR/F1; oracle significantly beats both on AUC-PR and F1 (p<0.05) — real, confirmed headroom from better criticality prediction, even though current conditioning doesn't yet capture much of it.
+- **Defensible framing**: not "criticality-conditioning improves compliance prediction" (not supportable — null at the honest N, and null on discrimination even at full N). Instead: "conditioning measurably improves probability calibration at scale, and there is statistically significant headroom versus a criticality oracle" — narrower, but actually true.
 - **Do not** headline train-max-F1 on the full training panel (rare positives + threshold overfitting).
 - **N caveat:** with `LAYER2_SCOPE=real_category_only`, Layer 2 runs on the ~100-120 parts with a genuine real DataCo category link, not the full 3500-part catalog — report this N explicitly; it's a smaller but fully-grounded result, not a like-for-like comparison with a full-catalog run (`LAYER2_SCOPE=all`).
+- **Tuning caveat:** the frozen config (`LATENT_TO_LABEL_NOISE`, `LATENT_TO_FEATURE_NOISE`, `CRIT_PROB_SHARPEN`) was searched to produce a conditioning effect (see "Tuned configuration" above) — disclose this search process, don't present the frozen config as an a priori choice.
 
 ## Retuning (optional)
 
