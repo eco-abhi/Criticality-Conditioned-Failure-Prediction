@@ -705,6 +705,48 @@ def metrics_by_criticality(
     return by
 
 
+def benjamini_hochberg_adjust(p_values: Sequence[float]) -> np.ndarray:
+    """FDR-adjusted (q-value) p-values for a family of simultaneous tests. NaN entries pass through
+    as NaN and are excluded from the family size used to adjust the others."""
+    p = np.asarray(p_values, dtype=float)
+    valid = np.isfinite(p)
+    out = np.full(p.shape, np.nan, dtype=float)
+    if not valid.any():
+        return out
+    pv = p[valid]
+    n = len(pv)
+    order = np.argsort(pv)
+    ranked = pv[order]
+    adjusted = ranked * n / (np.arange(n) + 1)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]  # enforce monotonicity
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    result = np.empty(n, dtype=float)
+    result[order] = adjusted
+    out[valid] = result
+    return out
+
+
+def bonferroni_adjust(p_values: Sequence[float]) -> np.ndarray:
+    """Bonferroni-adjusted p-values for a family of simultaneous tests (stricter than BH-FDR)."""
+    p = np.asarray(p_values, dtype=float)
+    valid = np.isfinite(p)
+    n = int(valid.sum())
+    out = np.full(p.shape, np.nan, dtype=float)
+    out[valid] = np.clip(p[valid] * max(n, 1), 0.0, 1.0)
+    return out
+
+
+def add_multiple_comparison_corrections(df: pd.DataFrame, p_col: str = "p_value_two_sided") -> pd.DataFrame:
+    """Adds p_value_fdr_bh and p_value_bonferroni columns, corrected across all rows of ``df`` as
+    one family (call once per coherent hypothesis family -- e.g. Layer 1's 3 tests and Layer 2's 9
+    tests should be corrected separately, not pooled, since they answer different questions)."""
+    out = df.copy()
+    p = out[p_col].to_numpy(dtype=float) if p_col in out.columns else np.full(len(out), np.nan)
+    out["p_value_fdr_bh"] = benjamini_hochberg_adjust(p)
+    out["p_value_bonferroni"] = bonferroni_adjust(p)
+    return out
+
+
 def bootstrap_part_level_metric_diff(
     part_ids: np.ndarray,
     y_true: np.ndarray,
@@ -812,7 +854,9 @@ def bootstrap_layer2_comparisons(
                     **res,
                 }
             )
-    return pd.DataFrame(rows)
+    # All 9 rows (3 comparisons x 3 metrics) corrected together as one family: they're all used
+    # to support the same "does conditioning help Layer 2" question.
+    return add_multiple_comparison_corrections(pd.DataFrame(rows))
 
 
 def bootstrap_layer1_comparisons(
@@ -851,7 +895,9 @@ def bootstrap_layer1_comparisons(
         except ValueError as e:
             res = {"error": str(e)}
         rows.append({"comparison": f"{b_name}_vs_{a_name}", "metric": "f1_macro", **res})
-    return pd.DataFrame(rows)
+    # All 3 rows corrected together as one family (separate from Layer 2's family -- different
+    # question, correcting them jointly would be unnecessarily conservative).
+    return add_multiple_comparison_corrections(pd.DataFrame(rows))
 
 
 def save_json(path: Path, obj: Any) -> None:
