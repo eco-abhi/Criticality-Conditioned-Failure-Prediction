@@ -10,6 +10,10 @@ Algorithm
 1. Assign every part to a tier based on criticality and a random depth draw.
 2. Build edges strictly upward: parts in tier T feed assemblies in tier T+1.
 3. Guarantee every non-root part has at least one consuming assembly.
+
+No public dataset gives real BOM depth/fan-out structure for this domain (investigated; see
+data_dictionary.md's BOM citation and scripts/check_bom_benchmark.py) -- this graph is entirely
+synthetic, literature-anchored (CIRP Annals), with a real-data face-validity scale check only.
 """
 from __future__ import annotations
 

@@ -1080,7 +1080,19 @@ def write_data_dictionary(
     lines.append("- DataCo SMART Supply Chain: Constante et al. (2019), Mendeley Data, doi:10.17632/8gx2fvg2k6.5; Kaggle: `shashwatwork/dataco-smart-supply-chain-for-big-data-analysis`.\n")
     lines.append("- UCI Online Retail: Chen et al. (2012), UCI ML Repository, https://doi.org/10.24432/C5BW3K.\n")
     lines.append("- Lead time uncertainty / CV bands: stochastic lead-time / supply uncertainty literature (Omega-style empirical studies; **synthetic** mapping in this notebook).\n")
-    lines.append("- Automotive BOM depth / fan-out: CIRP Annals automotive assembly / BOM complexity literature (**synthetic graph**).\n")
+    lines.append(
+        "- BOM depth / fan-out: CIRP Annals automotive assembly / BOM complexity literature "
+        "(**synthetic graph**). Also cross-checked against real disassembly data (Babbitt et al. "
+        "2020, Scientific Data, doi:10.1038/s41597-020-0573-9; CC0 raw data, "
+        "doi:10.6084/m9.figshare.11306792) via `scripts/check_bom_benchmark.py`: 108 real, "
+        "lab-disassembled consumer electronics products decompose into a mean of 4.82 (median 4, "
+        "range 1-13) major assemblies. **Not a depth/fan-out calibration** — verified directly "
+        "against the raw workbook that it records mass composition per named assembly, not "
+        "component counts or hierarchy depth, so it measures a different structural concept than "
+        "`BOM_FANOUT_MIN/MAX` (components per assembly in a multi-tier supply chain, vs. named "
+        "assemblies within one finished product) — offered as face-validity context (same order of "
+        "magnitude, single-digit-to-low-teens) only. See `outputs/bom_benchmark_disassembly.md`.\n"
+    )
     lines.append("- Supplier OTD targets / escalation: APQC performance management + industry quality reporting (**anchors**).\n")
     lines.append(
         "- Supplier-proxy identity and OTD / at-risk flag: computed directly from real DataCo order-line "

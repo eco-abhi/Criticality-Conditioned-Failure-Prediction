@@ -93,6 +93,7 @@ Key outputs under `outputs/modeling/`: `classification_comparison.csv`, `full_re
 - **`data_tests.py`** — Quick sanity prints on exported CSVs and the BOM graph.
 - **`_build_synthetic_notebook.py`** — Regenerates `synthetic_data_generator.ipynb` if you keep the notebook path in sync with the pipeline.
 - **`scripts/check_recall_benchmark.py`** — Optional, network-dependent: fetches real CPSC recall data (saferproducts.gov) as a face-validity scale check on `compliance_failure`'s calibrated rate (not a row-level real label — recall data gives counts, not rates; see the script's docstring and `data_dictionary.md`). Not run as part of the main pipeline. Writes `outputs/compliance_benchmark_cpsc.md`.
+- **`scripts/check_bom_benchmark.py`** — Optional, network-dependent: fetches real disassembly-based BOM data (Babbitt et al. 2020, Scientific Data, CC0) as a face-validity scale check on `bom_graph.py`'s fan-out range (not a depth/fan-out calibration — the source data doesn't report component counts or hierarchy depth; see the script's docstring and `data_dictionary.md`). Not run as part of the main pipeline. Writes `outputs/bom_benchmark_disassembly.md`.
 
 ## License / data use
 
