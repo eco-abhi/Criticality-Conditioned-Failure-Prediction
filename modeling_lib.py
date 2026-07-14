@@ -476,13 +476,13 @@ def part_level_train_test_split(
     return train_p, test_p
 
 
-def baseline_rule_abc_quantile(
+def baseline_rule_abc_predictions(
     part_catalog: pd.DataFrame,
     train_parts: np.ndarray,
     test_parts: np.ndarray,
     price_col: str = "abc_price_proxy",
-) -> Dict[str, Any]:
-    """20/30/50 quantile cuts on price proxy (quantiles fit on train parts only)."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shared logic for baseline_rule_abc_quantile; returns (test_part_ids, y_true, y_pred)."""
     train_mask = part_catalog["part_id"].isin(train_parts)
     prices_train = part_catalog.loc[train_mask, price_col].astype(float)
     q20 = float(prices_train.quantile(0.20))
@@ -497,9 +497,19 @@ def baseline_rule_abc_quantile(
 
     y_true = part_catalog["criticality_class"].map(CRIT_MAP).astype(int).values
     y_pred = part_catalog[price_col].astype(float).map(assign_abc).astype(int).values
-    test_mask = part_catalog["part_id"].isin(test_parts)
-    yt = y_true[test_mask.values]
-    yp = y_pred[test_mask.values]
+    test_mask = part_catalog["part_id"].isin(test_parts).values
+    part_ids_test = part_catalog["part_id"].astype(str).values[test_mask]
+    return part_ids_test, y_true[test_mask], y_pred[test_mask]
+
+
+def baseline_rule_abc_quantile(
+    part_catalog: pd.DataFrame,
+    train_parts: np.ndarray,
+    test_parts: np.ndarray,
+    price_col: str = "abc_price_proxy",
+) -> Dict[str, Any]:
+    """20/30/50 quantile cuts on price proxy (quantiles fit on train parts only)."""
+    _, yt, yp = baseline_rule_abc_predictions(part_catalog, train_parts, test_parts, price_col)
     return _multiclass_metrics_dict(yt, yp)
 
 
@@ -802,6 +812,45 @@ def bootstrap_layer2_comparisons(
                     **res,
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def bootstrap_layer1_comparisons(
+    part_ids_test: np.ndarray,
+    y_true_test: np.ndarray,
+    preds: Mapping[str, np.ndarray],
+    n_boot: int = 2000,
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """
+    Part-level bootstrap CIs for the three pairwise Layer 1 macro-F1 comparisons. ``preds`` maps
+    {"Baseline1_rule_price": y_pred, "Baseline2_LGBM_tabular": y_pred, "Layer1_LGBM_GAT": y_pred}
+    (predicted class labels, not scores).
+
+    Each Layer 1 test row is already one part (no part-month repetition here, unlike Layer 2), so
+    this is a standard bootstrap over parts -- reuses bootstrap_part_level_metric_diff directly by
+    passing class-label arrays as "scores" (the helper is agnostic to what metric_fn does with them).
+    """
+
+    def macro_f1(y: np.ndarray, yp: np.ndarray) -> float:
+        return float(f1_score(y, yp, average="macro", zero_division=0))
+
+    pairs = [
+        ("Baseline2_LGBM_tabular", "Baseline1_rule_price"),
+        ("Layer1_LGBM_GAT", "Baseline1_rule_price"),
+        ("Layer1_LGBM_GAT", "Baseline2_LGBM_tabular"),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for b_name, a_name in pairs:
+        if a_name not in preds or b_name not in preds:
+            continue
+        try:
+            res = bootstrap_part_level_metric_diff(
+                part_ids_test, y_true_test, preds[a_name], preds[b_name], macro_f1, n_boot=n_boot, random_state=random_state
+            )
+        except ValueError as e:
+            res = {"error": str(e)}
+        rows.append({"comparison": f"{b_name}_vs_{a_name}", "metric": "f1_macro", **res})
     return pd.DataFrame(rows)
 
 

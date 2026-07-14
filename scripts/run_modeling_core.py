@@ -165,6 +165,31 @@ def run_pipeline(
         train_crit_mat = bundle["oof_probs"][pi_train]
         pi_test = df_test["part_id"].map(part_to_idx).to_numpy()
         test_crit_mat = bundle["final_probs_all"][pi_test]
+        final_probs_all = bundle["final_probs_all"]
+
+    # Bootstrap CIs for the Layer 1 classification comparisons. All three prediction arrays must
+    # be aligned to the SAME part order for a valid element-wise comparison -- use
+    # part_order[test_indices] (the order X_tab/y_part/final_probs_all are already built in) as
+    # the canonical order, reindexing baseline1's own (differently-ordered) output into it.
+    test_part_ids_canonical = np.array(part_order)[test_indices]
+    y_true_canonical = y_part[test_indices]
+    y_pred_layer1_canonical = np.argmax(final_probs_all[test_indices], axis=1)
+    y_pred_b2_canonical = lgbm_tab.predict(ml._lgbm_df(X_scaled_tab[test_indices]))
+    b1_part_ids, _, b1_y_pred = ml.baseline_rule_abc_predictions(part_catalog, train_parts, test_parts)
+    y_pred_b1_canonical = (
+        pd.Series(b1_y_pred, index=b1_part_ids).reindex(test_part_ids_canonical).to_numpy()
+    )
+    l1_boot_df = ml.bootstrap_layer1_comparisons(
+        test_part_ids_canonical,
+        y_true_canonical,
+        {
+            "Baseline1_rule_price": y_pred_b1_canonical,
+            "Baseline2_LGBM_tabular": y_pred_b2_canonical,
+            "Layer1_LGBM_GAT": y_pred_layer1_canonical,
+        },
+        n_boot=int(os.environ.get("L2_BOOTSTRAP_N", "2000")),
+    )
+    l1_boot_df.to_csv(out_dir / "classification_comparison_bootstrap.csv", index=False)
 
     layer1_rows = [
         ml.classification_metrics_row("Baseline1_rule_price", b1),
