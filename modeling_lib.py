@@ -630,9 +630,12 @@ def train_gat_classifier(
     lr: float = 0.005,
     weight_decay: float = 1e-4,
     device: Optional[torch.device] = None,
+    hidden: int = 64,
+    embed_dim: int = 32,
+    dropout: float = 0.3,
 ) -> Tuple[GATClassifier, List[float]]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GATClassifier(x.shape[1]).to(device)
+    model = GATClassifier(x.shape[1], hidden=hidden, embed_dim=embed_dim, dropout=dropout).to(device)
     y_train = y[train_mask].cpu().numpy()
     cw = class_weights_from_labels(y_train).to(device)
     crit = torch.nn.CrossEntropyLoss(weight=cw)
@@ -1138,11 +1141,19 @@ def oof_layer1_gat_lgbm(
     gat_epochs_oof: int = 80,
     device: Optional[torch.device] = None,
     random_state: int = 42,
+    gat_kwargs: Optional[Dict[str, Any]] = None,
+    lgbm_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, List[List[float]]]:
     """
     For each training part, out-of-fold multiclass probabilities from GAT+LGBM stack.
     oof_probs rows align with part_order (zeros for non-train rows).
+
+    ``gat_kwargs`` overrides train_gat_classifier's hidden/embed_dim/dropout/lr/weight_decay
+    defaults; ``lgbm_params`` overrides the stacking LGBMClassifier's LGBM_MULTICLASS_PARAMS
+    defaults -- both used by scripts/hyperparameter_search.py to apply a searched config.
     """
+    gat_kwargs = gat_kwargs or {}
+    lgbm_params = lgbm_params if lgbm_params is not None else LGBM_MULTICLASS_PARAMS
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     N = len(part_order)
     oof = np.zeros((N, 3), dtype=np.float64)
@@ -1168,12 +1179,13 @@ def oof_layer1_gat_lgbm(
             train_mask,
             epochs=gat_epochs_oof,
             device=device,
+            **gat_kwargs,
         )
         all_losses.append(losses)
         emb_full, _ = gat_embeddings_and_logits(model, x_t, edge_index_full, device=device)
         X_lgb_tr = np.hstack([X_scaled[tr_idx], emb_full[tr_idx]])
         X_lgb_va = np.hstack([X_scaled[va_idx], emb_full[va_idx]])
-        clf = LGBMClassifier(objective="multiclass", num_class=3, **LGBM_MULTICLASS_PARAMS)
+        clf = LGBMClassifier(objective="multiclass", num_class=3, **lgbm_params)
         clf.fit(_lgbm_df(X_lgb_tr), y_all[tr_idx])
         oof[va_idx] = clf.predict_proba(_lgbm_df(X_lgb_va))
         del model, clf
@@ -1190,8 +1202,14 @@ def fit_final_layer1_gat_lgbm(
     edge_index_full: torch.Tensor,
     gat_epochs_final: int = 200,
     device: Optional[torch.device] = None,
+    gat_kwargs: Optional[Dict[str, Any]] = None,
+    lgbm_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[StandardScaler, GATClassifier, LGBMClassifier, List[float], np.ndarray]:
-    """Train scaler + GAT + stacking LGBM on all training parts; return test-ready artifacts."""
+    """Train scaler + GAT + stacking LGBM on all training parts; return test-ready artifacts.
+
+    ``gat_kwargs``/``lgbm_params``: see oof_layer1_gat_lgbm docstring."""
+    gat_kwargs = gat_kwargs or {}
+    lgbm_params = lgbm_params if lgbm_params is not None else LGBM_MULTICLASS_PARAMS
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     N = len(part_order)
     scaler = StandardScaler()
@@ -1209,10 +1227,11 @@ def fit_final_layer1_gat_lgbm(
         train_mask,
         epochs=gat_epochs_final,
         device=device,
+        **gat_kwargs,
     )
     emb_full, _ = gat_embeddings_and_logits(model, x_t, edge_index_full, device=device)
     X_lgb_tr = np.hstack([X_scaled[train_indices], emb_full[train_indices]])
-    clf = LGBMClassifier(objective="multiclass", num_class=3, **LGBM_MULTICLASS_PARAMS)
+    clf = LGBMClassifier(objective="multiclass", num_class=3, **lgbm_params)
     clf.fit(_lgbm_df(X_lgb_tr), y_all[train_indices])
     return scaler, model, clf, losses, emb_full
 
