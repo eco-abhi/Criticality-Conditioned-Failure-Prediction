@@ -302,25 +302,6 @@ def threshold_validation_max_f1_report(
     }
 
 
-def part_level_train_val_split(
-    part_catalog: pd.DataFrame,
-    train_parts: Sequence[str],
-    val_fraction: float = 0.2,
-    random_state: int = 43,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Split training parts into fit vs validation (stratified on ABC)."""
-    pc = part_catalog[part_catalog["part_id"].astype(str).isin(list(train_parts))].copy()
-    parts = pc["part_id"].astype(str).values
-    y = pc["criticality_class"].map(CRIT_MAP).astype(int).values
-    fit_p, val_p = train_test_split(
-        parts,
-        test_size=val_fraction,
-        random_state=random_state,
-        stratify=y,
-    )
-    return fit_p, val_p
-
-
 def _lgbm_df(X: np.ndarray) -> pd.DataFrame:
     """Consistent column names for LightGBM sklearn API (avoids feature-name warnings)."""
     X = np.asarray(X, dtype=np.float64)
@@ -1125,46 +1106,57 @@ def run_layer2_evaluation(
     y_tr = df_train["compliance_failure"].to_numpy(dtype=int)
     y_te = df_test["compliance_failure"].to_numpy(dtype=int)
 
-    # Genuine held-out fit/val split *within* train (fit_parts and val_parts are disjoint),
-    # via part_level_train_val_split -- also works when df_train has been scoped down (e.g.
-    # LAYER2_SCOPE=real_category_only) since it's derived from parts actually present in df_train,
-    # not the raw `train_parts` arg.
+    # K-fold out-of-fold validation scores, part-level and stratified by criticality (same pattern
+    # as Layer 1's oof_layer1_gat_lgbm) -- every train row gets a genuinely held-out validation
+    # score exactly once, pooled across folds, instead of relying on a single ~20% split.
     #
-    # NOTE: this replaces a prior bug where s_val was produced by scoring the SAME model used for
-    # s_te (fit on all of df_train) on a subset of its own training rows -- in-sample, not held
-    # out. That inflated threshold_validation_max_f1_report's validation F1 (it hit the ~1.0
-    # ceiling at LAYER2_SCOPE=real_category_only's smaller N, where a 127-leaf LightGBM can nearly
-    # memorize ~1.9k training rows). Now s_val comes from a model fit only on fit_mask rows.
+    # NOTE: this replaces two prior issues in sequence. (1) A bug where s_val was produced by
+    # scoring the SAME model used for s_te (fit on all of df_train) on a subset of its own
+    # training rows -- in-sample, not held out; fixed by fitting a separate model on a disjoint
+    # fit/val split. (2) That single-split fix was itself unstable at LAYER2_SCOPE=
+    # real_category_only's small N (~78 train parts): a 20% val slice is only ~16 parts, so
+    # threshold selection had high variance (e.g. oracle scoring below conditioned in one run --
+    # noise, not signal). Pooled OOF over all folds uses every part's validation signal instead of
+    # one slice's.
     train_parts_present = df_train["part_id"].astype(str).unique()
-    fit_parts, val_parts = part_level_train_val_split(
-        part_catalog, train_parts_present, val_fraction=0.2, random_state=43
+    y_part_present = (
+        part_catalog.set_index("part_id").loc[list(train_parts_present)]["criticality_class"].map(CRIT_MAP).to_numpy()
     )
-    fit_mask = df_train["part_id"].isin(fit_parts).to_numpy()
-    val_mask = df_train["part_id"].isin(val_parts).to_numpy()
-    y_val = y_tr[val_mask]
+    min_class_count = int(np.bincount(y_part_present).min())
+    n_splits = max(2, min(5, min_class_count))
+    skf_l2 = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=43)
+    part_arr = df_train["part_id"].astype(str).to_numpy()
 
     spw = int((y_tr == 0).sum()) / max(int((y_tr == 1).sum()), 1)
     l2_params = _l2_classifier_params(spw)
 
     def _fit_predict(df_tr: pd.DataFrame, df_te: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """s_te: production model, fit on all of df_tr, scored on held-out test parts (df_te).
-        s_val: a separate model, fit only on fit_mask rows (excluding val_mask rows), scored on
-        val_mask rows -- genuinely held out, unlike scoring the production model on its own train
-        data."""
+        s_val: pooled out-of-fold scores over df_tr's own rows -- each row scored only by a model
+        that excluded its part from fitting, so it's genuinely held out despite covering all of
+        df_tr (not just one val slice)."""
         Xtr = df_tr[l2_cols].to_numpy(dtype=np.float64)
         Xte = df_te[l2_cols].to_numpy(dtype=np.float64)
         m = LGBMClassifier(objective="binary", **l2_params)
         m.fit(_lgbm_df(Xtr), y_tr)
         s_te = m.predict_proba(_lgbm_df(Xte))[:, 1]
 
-        m_val = LGBMClassifier(objective="binary", **l2_params)
-        m_val.fit(_lgbm_df(Xtr[fit_mask]), y_tr[fit_mask])
-        s_val = m_val.predict_proba(_lgbm_df(Xtr[val_mask]))[:, 1]
+        s_val = np.full(len(df_tr), np.nan, dtype=float)
+        for fit_idx, val_idx in skf_l2.split(train_parts_present, y_part_present):
+            fit_parts_fold = set(train_parts_present[fit_idx])
+            val_parts_fold = set(train_parts_present[val_idx])
+            fit_mask_fold = np.isin(part_arr, list(fit_parts_fold))
+            val_mask_fold = np.isin(part_arr, list(val_parts_fold))
+            m_fold = LGBMClassifier(objective="binary", **l2_params)
+            m_fold.fit(_lgbm_df(Xtr[fit_mask_fold]), y_tr[fit_mask_fold])
+            s_val[val_mask_fold] = m_fold.predict_proba(_lgbm_df(Xtr[val_mask_fold]))[:, 1]
+        assert np.isfinite(s_val).all(), "Layer 2 OOF validation scores incomplete"
         return s_te, s_val
 
     s_uni_te, s_uni_val = _fit_predict(df_tr_u, df_te_u)
     s_cond_te, s_cond_val = _fit_predict(df_tr_f, df_te_f)
     s_orac_te, s_orac_val = _fit_predict(df_tr_o, df_te_o)
+    y_val = y_tr
 
     thr_def = 0.5
     m_uni = binary_metrics_suite(y_te, s_uni_te, threshold=thr_def)
