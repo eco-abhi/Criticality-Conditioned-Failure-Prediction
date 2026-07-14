@@ -1079,6 +1079,20 @@ def write_data_dictionary(
     lines.append("\n## Citations (non-exhaustive)\n")
     lines.append("- DataCo SMART Supply Chain: Constante et al. (2019), Mendeley Data, doi:10.17632/8gx2fvg2k6.5; Kaggle: `shashwatwork/dataco-smart-supply-chain-for-big-data-analysis`.\n")
     lines.append("- UCI Online Retail: Chen et al. (2012), UCI ML Repository, https://doi.org/10.24432/C5BW3K.\n")
+    lines.append(
+        "- ABC class-size convention (A_SHARE/B_SHARE/C_SHARE = 20/30/50): no public dataset gives "
+        "real part-level criticality ground truth (proprietary business judgments; only "
+        "methodology papers are public — investigated, see project history). The class-SIZE "
+        "convention (not the label-assignment mechanism) is checked against real revenue "
+        "concentration in the DataCo/UCI backbones already in hand via "
+        "`scripts/check_abc_share_benchmark.py`: real UCI per-SKU revenue is top-20%-of-SKUs → "
+        "79.5% of revenue (Gini 0.763); real DataCo per-product sales is even more concentrated "
+        "(95.1%, Gini 0.883, n=118). Both confirm the real backbones follow a Pareto-style skew "
+        "consistent with a 20/30/50 split being a reasonable convention. **Does not validate** "
+        "`SYNTHETIC_GENERATOR_MODE=latent`'s label-assignment mechanism, which deliberately "
+        "decouples labels from price/revenue (to avoid a trivial price→label→feature chain) — see "
+        "`outputs/abc_share_benchmark.md`.\n"
+    )
     lines.append("- Lead time uncertainty / CV bands: stochastic lead-time / supply uncertainty literature (Omega-style empirical studies; **synthetic** mapping in this notebook).\n")
     lines.append(
         "- BOM depth / fan-out: CIRP Annals automotive assembly / BOM complexity literature "
