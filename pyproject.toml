@@ -29,6 +29,7 @@ modeling = [
     "shap>=0.44",
     "torch>=2.2",
     "torch-geometric>=2.5",
+    "statsmodels>=0.14",
 ]
 
 [tool.uv]
