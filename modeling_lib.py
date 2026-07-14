@@ -167,8 +167,33 @@ def add_crit_prob_at_risk_interactions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_uniform_crit_probs(df: pd.DataFrame) -> pd.DataFrame:
+    """Deliberately uninformative baseline: (1/3, 1/3, 1/3) regardless of the true class balance.
+
+    Kept for transparency/comparison, but ``attach_marginal_prior_crit_probs`` is the fairer
+    reference baseline for measuring conditioning's gain -- a naive uniform prior understates what
+    a simple, informationless-about-THIS-part-but-not-about-the-population baseline can already
+    achieve, inflating the apparent value of conditioning. See reviewer feedback: comparing against
+    uniform (rather than the true marginal class distribution) is a weak baseline.
+    """
     out = df.copy()
     out[["crit_prob_A", "crit_prob_B", "crit_prob_C"]] = 1.0 / 3.0
+    return add_crit_prob_at_risk_interactions(out)
+
+
+def attach_marginal_prior_crit_probs(df: pd.DataFrame, part_catalog: pd.DataFrame, train_parts: Sequence[str]) -> pd.DataFrame:
+    """Prior-informed baseline: every row gets the TRAINING population's true empirical class
+    shares (not part-specific -- still uninformative about which individual part it is, but
+    correctly informed about the overall A/B/C base rates), rather than a naive (1/3, 1/3, 1/3).
+
+    Computed empirically from train_parts' actual criticality_class distribution rather than
+    hardcoding the generator's A_SHARE/B_SHARE/C_SHARE constants, so this stays correct even if
+    those change.
+    """
+    train_classes = part_catalog.set_index("part_id").loc[list(train_parts)]["criticality_class"].astype(str)
+    shares = train_classes.value_counts(normalize=True)
+    out = df.copy()
+    for c in ["A", "B", "C"]:
+        out[f"crit_prob_{c}"] = float(shares.get(c, 0.0))
     return add_crit_prob_at_risk_interactions(out)
 
 
@@ -822,16 +847,32 @@ def bootstrap_layer2_comparisons(
     scores: Mapping[str, np.ndarray],
     n_boot: int = 2000,
     random_state: int = 0,
+    pairs: Optional[List[Tuple[str, str]]] = None,
 ) -> pd.DataFrame:
     """
-    Part-level bootstrap CIs for the three pairwise Layer 2 comparisons (conditioned vs uniform,
-    oracle vs uniform, oracle vs conditioned) across auc_roc, auc_pr, brier, and f1@0.5. ``scores``
-    maps {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te}.
+    Part-level bootstrap CIs for pairwise Layer 2 comparisons across auc_roc, auc_pr, brier, and
+    f1@0.5. ``scores`` maps model name -> test scores, e.g. {"uniform": ..., "prior": ...,
+    "conditioned": ..., "oracle": ...}.
+
+    Default ``pairs`` covers both the naive-baseline comparison (kept for transparency) and the
+    fairer prior-informed-baseline comparison the reviewer feedback asked for: "prior" (marginal
+    class-share baseline) is the harder, more honest bar for "conditioned" to clear than "uniform"
+    ((1/3,1/3,1/3)), which understates what a population-informed-but-part-blind baseline already
+    achieves and inflates the apparent value of conditioning.
 
     Metric direction: higher auc_roc, auc_pr and f1 are better; LOWER brier is better, so a
     negative point_diff for brier means the second model in the pair improved on the first (fewer
     errors).
     """
+    if pairs is None:
+        pairs = [
+            ("conditioned", "uniform"),
+            ("oracle", "uniform"),
+            ("oracle", "conditioned"),
+            ("conditioned", "prior"),
+            ("oracle", "prior"),
+        ]
+        pairs = [(b, a) for b, a in pairs if a in scores and b in scores]
     part_ids = df_test["part_id"].astype(str).to_numpy()
     metric_fns: Dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
         "auc_roc": lambda y, s: roc_auc_score(y, s),
@@ -839,7 +880,6 @@ def bootstrap_layer2_comparisons(
         "brier": lambda y, s: brier_score_loss(y, s),
         "f1_at_0.5": lambda y, s: f1_score(y, (np.asarray(s) >= 0.5).astype(int), zero_division=0),
     }
-    pairs = [("conditioned", "uniform"), ("oracle", "uniform"), ("oracle", "conditioned")]
     rows: List[Dict[str, Any]] = []
     for b_name, a_name in pairs:
         for metric_name, fn in metric_fns.items():
@@ -1306,6 +1346,8 @@ def run_layer2_evaluation(
 
     df_tr_u = attach_uniform_crit_probs(df_train)
     df_te_u = attach_uniform_crit_probs(df_test)
+    df_tr_p = attach_marginal_prior_crit_probs(df_train, part_catalog, train_parts)
+    df_te_p = attach_marginal_prior_crit_probs(df_test, part_catalog, train_parts)
     df_tr_f = attach_crit_prob_matrix(df_train, train_crit_mat)
     df_te_f = attach_crit_prob_matrix(df_test, test_crit_mat)
     df_tr_o = attach_oracle_crit_probs(df_train)
@@ -1363,19 +1405,23 @@ def run_layer2_evaluation(
         return s_te, s_val
 
     s_uni_te, s_uni_val = _fit_predict(df_tr_u, df_te_u)
+    s_prior_te, s_prior_val = _fit_predict(df_tr_p, df_te_p)
     s_cond_te, s_cond_val = _fit_predict(df_tr_f, df_te_f)
     s_orac_te, s_orac_val = _fit_predict(df_tr_o, df_te_o)
     y_val = y_tr
 
     thr_def = 0.5
     m_uni = binary_metrics_suite(y_te, s_uni_te, threshold=thr_def)
+    m_prior = binary_metrics_suite(y_te, s_prior_te, threshold=thr_def)
     m_cond = binary_metrics_suite(y_te, s_cond_te, threshold=thr_def)
     m_orac = binary_metrics_suite(y_te, s_orac_te, threshold=thr_def)
     by_uni = metrics_by_criticality(df_test, y_te, s_uni_te, threshold=thr_def)
+    by_prior = metrics_by_criticality(df_test, y_te, s_prior_te, threshold=thr_def)
     by_cond = metrics_by_criticality(df_test, y_te, s_cond_te, threshold=thr_def)
     by_orac = metrics_by_criticality(df_test, y_te, s_orac_te, threshold=thr_def)
 
     rep_val_u = threshold_validation_max_f1_report("uniform", y_val, s_uni_val, y_te, s_uni_te)
+    rep_val_p = threshold_validation_max_f1_report("prior", y_val, s_prior_val, y_te, s_prior_te)
     rep_val_c = threshold_validation_max_f1_report("conditioned", y_val, s_cond_val, y_te, s_cond_te)
     rep_val_o = threshold_validation_max_f1_report("oracle", y_val, s_orac_val, y_te, s_orac_te)
 
@@ -1383,6 +1429,7 @@ def run_layer2_evaluation(
     biz_rows: List[Dict[str, Any]] = []
     for name, scores in [
         ("uniform", s_uni_te),
+        ("prior", s_prior_te),
         ("conditioned", s_cond_te),
         ("oracle", s_orac_te),
     ]:
@@ -1392,11 +1439,12 @@ def run_layer2_evaluation(
     pd.DataFrame(
         [
             {"model": "uniform", **m_uni},
+            {"model": "prior", **m_prior},
             {"model": "conditioned", **m_cond},
             {"model": "oracle", **m_orac},
         ]
     ).to_csv(out_dir / "compliance_comparison.csv", index=False)
-    pd.DataFrame([rep_val_u, rep_val_c, rep_val_o]).to_csv(
+    pd.DataFrame([rep_val_u, rep_val_p, rep_val_c, rep_val_o]).to_csv(
         out_dir / "compliance_comparison_val_threshold.csv", index=False
     )
     pd.DataFrame(biz_rows).to_csv(out_dir / "compliance_comparison_business_thresholds.csv", index=False)
@@ -1405,7 +1453,7 @@ def run_layer2_evaluation(
     boot_df = bootstrap_layer2_comparisons(
         df_test,
         y_te,
-        {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te},
+        {"uniform": s_uni_te, "prior": s_prior_te, "conditioned": s_cond_te, "oracle": s_orac_te},
         n_boot=n_boot,
         random_state=0,
     )
@@ -1425,6 +1473,10 @@ def run_layer2_evaluation(
     save_json(
         out_dir / "layer2_baseline_uniform.json",
         {"overall": m_uni, "by_criticality_true": by_uni, "validation_threshold": rep_val_u},
+    )
+    save_json(
+        out_dir / "layer2_baseline_marginal_prior.json",
+        {"overall": m_prior, "by_criticality_true": by_prior, "validation_threshold": rep_val_p},
     )
     save_json(
         out_dir / "layer2_full_conditioned.json",
@@ -1447,25 +1499,37 @@ def run_layer2_evaluation(
     }
     save_json(out_dir / "modeling_manifest.json", manifest)
 
-    cond_vs_uni_auc_pr = boot_df[(boot_df["comparison"] == "conditioned_vs_uniform") & (boot_df["metric"] == "auc_pr")]
-    boot_summary = cond_vs_uni_auc_pr.iloc[0].to_dict() if len(cond_vs_uni_auc_pr) else {}
+    def _boot_lookup(comparison: str, metric: str) -> Dict[str, Any]:
+        rows = boot_df[(boot_df["comparison"] == comparison) & (boot_df["metric"] == metric)]
+        return rows.iloc[0].to_dict() if len(rows) else {}
+
+    boot_summary = _boot_lookup("conditioned_vs_uniform", "auc_pr")
+    boot_summary_prior = _boot_lookup("conditioned_vs_prior", "auc_pr")
 
     return {
         "uniform_auc_pr": m_uni["auc_pr"],
+        "prior_auc_pr": m_prior["auc_pr"],
         "conditioned_auc_pr": m_cond["auc_pr"],
         "oracle_auc_pr": m_orac["auc_pr"],
         "delta_auc_pr_cond_minus_uniform": m_cond["auc_pr"] - m_uni["auc_pr"],
         "delta_auc_pr_cond_minus_uniform_ci95": [boot_summary.get("ci_low"), boot_summary.get("ci_high")],
         "delta_auc_pr_cond_minus_uniform_p_value": boot_summary.get("p_value_two_sided"),
+        # Fairer comparison per reviewer feedback: conditioned vs the prior-informed (true
+        # marginal class share) baseline, not the naive uniform one.
+        "delta_auc_pr_cond_minus_prior": m_cond["auc_pr"] - m_prior["auc_pr"],
+        "delta_auc_pr_cond_minus_prior_ci95": [boot_summary_prior.get("ci_low"), boot_summary_prior.get("ci_high")],
+        "delta_auc_pr_cond_minus_prior_p_value": boot_summary_prior.get("p_value_two_sided"),
         "uniform_brier": m_uni["brier"],
+        "prior_brier": m_prior["brier"],
         "conditioned_brier": m_cond["brier"],
         "y_test": y_te,
         "scores_test": {
             "uniform": s_uni_te,
+            "prior": s_prior_te,
             "conditioned": s_cond_te,
             "oracle": s_orac_te,
         },
-        "metrics": {"uniform": m_uni, "conditioned": m_cond, "oracle": m_orac},
-        "by_criticality": {"uniform": by_uni, "conditioned": by_cond, "oracle": by_orac},
+        "metrics": {"uniform": m_uni, "prior": m_prior, "conditioned": m_cond, "oracle": m_orac},
+        "by_criticality": {"uniform": by_uni, "prior": by_prior, "conditioned": by_cond, "oracle": by_orac},
         **manifest,
     }
