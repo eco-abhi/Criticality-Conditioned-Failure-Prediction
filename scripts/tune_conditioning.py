@@ -80,7 +80,8 @@ def main() -> None:
     base["LAYER1_FEATURES"] = "clean"
     base["N_PARTS"] = str(args.n_parts)
     base["SYNTHETIC_GENERATOR_MODE"] = "latent"
-    base["L2_NUM_LEAVES"] = "127"
+    base["L2_NUM_LEAVES"] = "63"
+    base["L2_LEARNING_RATE"] = "0.0143"
     base["LAYER2_SCOPE"] = "real_category_only"
 
     rows: list[dict] = []

@@ -27,7 +27,8 @@ PAPER_ENV = {
     "LAYER1_FEATURES": "clean",
     "COMPLIANCE_GRAIN": "part_month",
     "CRIT_PROB_SHARPEN": "0.88",
-    "L2_NUM_LEAVES": "127",
+    "L2_NUM_LEAVES": "63",
+    "L2_LEARNING_RATE": "0.0143",
     "N_PARTS": "3500",
     "LAYER2_SCOPE": "real_category_only",
 }

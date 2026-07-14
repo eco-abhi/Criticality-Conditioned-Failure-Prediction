@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from lightgbm import LGBMClassifier
 from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -83,22 +84,30 @@ CRIT_PROB_AT_RISK_INTERACTION_FEATURES: List[str] = [
     "crit_prob_C_x_at_risk",
 ]
 
+# Random-search winner (scripts/hyperparameter_search.py, trial 9/20, part-level 5-fold CV on
+# training parts, cv_macro_f1=0.596 vs the pre-search config's un-searched defaults). See
+# outputs/modeling/hparam_search_layer1_lgbm.csv for all trials and best_hparams.json for the
+# full search record (reviewer feedback item #4a).
 LGBM_MULTICLASS_PARAMS = dict(
-    n_estimators=500,
-    learning_rate=0.05,
-    num_leaves=63,
-    min_child_samples=20,
+    n_estimators=300,
+    learning_rate=0.013624166758734327,
+    num_leaves=127,
+    min_child_samples=40,
     class_weight="balanced",
     random_state=42,
     verbosity=-1,
     n_jobs=1,
 )
 
+# Random-search winner (scripts/hyperparameter_search.py, trial 9/20, part-level 5-fold CV on
+# training parts, cv_auc_pr=0.234). num_leaves/learning_rate here are overridden by
+# _l2_classifier_params's L2_NUM_LEAVES/L2_LEARNING_RATE env defaults below -- update both places
+# together. See outputs/modeling/hparam_search_layer2_lgbm.csv / best_hparams.json.
 LGBM_BINARY_PARAMS = dict(
-    n_estimators=500,
-    learning_rate=0.05,
+    n_estimators=300,
+    learning_rate=0.014349743490619828,
     num_leaves=63,
-    min_child_samples=20,
+    min_child_samples=40,
     random_state=42,
     verbosity=-1,
     n_jobs=1,
@@ -588,15 +597,20 @@ def predict_part_criticality_proba(
 
 
 class GATClassifier(torch.nn.Module):
-    """Two-layer GAT with classification head for training; embeddings are pre-head."""
+    """Two-layer GAT with classification head for training; embeddings are pre-head.
+
+    Defaults are the random-search winner (scripts/hyperparameter_search.py, trial 7/12, 80/20
+    train-part fit/val split, val_macro_f1=0.571). See outputs/modeling/hparam_search_gat.csv /
+    best_hparams.json.
+    """
 
     def __init__(
         self,
         in_dim: int,
         hidden: int = 64,
-        embed_dim: int = 32,
+        embed_dim: int = 16,
         num_classes: int = 3,
-        dropout: float = 0.3,
+        dropout: float = 0.32186879374737387,
     ):
         super().__init__()
         self.dropout_p = dropout
@@ -627,12 +641,12 @@ def train_gat_classifier(
     y: torch.Tensor,
     train_mask: torch.Tensor,
     epochs: int = 200,
-    lr: float = 0.005,
-    weight_decay: float = 1e-4,
+    lr: float = 0.0017599512856804373,
+    weight_decay: float = 0.0002618382462550131,
     device: Optional[torch.device] = None,
     hidden: int = 64,
-    embed_dim: int = 32,
-    dropout: float = 0.3,
+    embed_dim: int = 16,
+    dropout: float = 0.32186879374737387,
 ) -> Tuple[GATClassifier, List[float]]:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GATClassifier(x.shape[1], hidden=hidden, embed_dim=embed_dim, dropout=dropout).to(device)
@@ -1067,6 +1081,69 @@ def plot_calibration_uniform_vs_full_stratum(
     return True
 
 
+def fit_isotonic_calibration(y_val: np.ndarray, s_val: np.ndarray) -> IsotonicRegression:
+    """
+    Fit isotonic regression calibration on genuinely held-out validation scores.
+
+    Reviewer feedback: "The paper mentions calibration via isotonic regression but does not
+    report calibration curves... by class." This was not previously implemented anywhere in the
+    codebase; added here. Fit ONLY on validation scores (the pooled OOF scores from
+    run_layer2_evaluation, never the test scores being calibrated for final reporting) -- fitting
+    on test data would leak test-set information into the calibration map.
+    """
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(np.asarray(s_val, dtype=float), np.asarray(y_val, dtype=int))
+    return iso
+
+
+def plot_calibration_pre_post_by_class(
+    criticality: np.ndarray,
+    y_true: np.ndarray,
+    score_pre: np.ndarray,
+    score_post: np.ndarray,
+    stratum: str,
+    path: Path,
+    n_bins: int = 8,
+) -> bool:
+    """
+    Reliability diagram for one true-criticality stratum (test rows): pre- vs post-isotonic-
+    calibration scores, on the same axes. Returns False if too few rows/events to draw a stable
+    curve (no file written) -- mirrors plot_calibration_uniform_vs_full_stratum's thin-sample guard.
+    """
+    m = np.asarray(criticality).astype(str) == str(stratum)
+    y = np.asarray(y_true).astype(int)[m]
+    sp = np.asarray(score_pre, dtype=float)[m]
+    sq = np.asarray(score_post, dtype=float)[m]
+    if y.size < 20 or int(y.sum()) < 3:
+        return False
+    n_bins_eff = int(max(2, min(n_bins, y.sum(), len(y) // 5)))
+    plt.figure(figsize=(5.5, 4.5))
+    drew_any = False
+    for scores, label, color in [
+        (sp, "Pre-calibration", "#1f77b4"),
+        (sq, "Post-isotonic", "#2ca02c"),
+    ]:
+        try:
+            prob_true, prob_pred = calibration_curve(y, scores, n_bins=n_bins_eff, strategy="uniform")
+        except ValueError:
+            continue
+        plt.plot(prob_pred, prob_true, marker="o", label=label, color=color)
+        drew_any = True
+    if not drew_any:
+        plt.close()
+        return False
+    plt.plot([0, 1], [0, 1], "k--", alpha=0.35, label="Perfect")
+    plt.xlabel("Mean predicted risk")
+    plt.ylabel("Fraction positives")
+    plt.legend(loc="lower right")
+    plt.title(f"Calibration — {stratum}-parts, pre vs post isotonic (n={len(y)}, positives={int(y.sum())})")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return True
+
+
 def shap_bar_top_multiclass(
     model: LGBMClassifier,
     X: np.ndarray,
@@ -1331,9 +1408,10 @@ def business_value_summary(
 
 
 def _l2_classifier_params(scale_pos_weight: float) -> dict:
-    """Layer 2 LightGBM params (env overrides for leaves / lr / class weight)."""
-    nl = int(os.environ.get("L2_NUM_LEAVES", "127"))
-    lr = float(os.environ.get("L2_LEARNING_RATE", "0.05"))
+    """Layer 2 LightGBM params (env overrides for leaves / lr / class weight). Defaults are the
+    random-search winners -- see LGBM_BINARY_PARAMS comment / outputs/modeling/best_hparams.json."""
+    nl = int(os.environ.get("L2_NUM_LEAVES", "63"))
+    lr = float(os.environ.get("L2_LEARNING_RATE", "0.014349743490619828"))
     cw = os.environ.get("L2_CLASS_WEIGHT", "").strip().lower()
     params = {**LGBM_BINARY_PARAMS, "num_leaves": nl, "learning_rate": lr}
     if cw == "balanced":
@@ -1429,6 +1507,20 @@ def run_layer2_evaluation(
     s_orac_te, s_orac_val = _fit_predict(df_tr_o, df_te_o)
     y_val = y_tr
 
+    # Isotonic regression calibration (reviewer feedback: "calibration via isotonic regression"
+    # was mentioned but not implemented/reported anywhere -- added here). Fit on validation scores
+    # only, applied to test scores; never fit on the test scores being calibrated.
+    calib = {}
+    for name, s_val, s_te in [
+        ("uniform", s_uni_val, s_uni_te),
+        ("prior", s_prior_val, s_prior_te),
+        ("conditioned", s_cond_val, s_cond_te),
+        ("oracle", s_orac_val, s_orac_te),
+    ]:
+        iso = fit_isotonic_calibration(y_val, s_val)
+        calib[name] = iso.predict(np.asarray(s_te, dtype=float))
+    s_cond_te_calibrated = calib["conditioned"]
+
     thr_def = 0.5
     m_uni = binary_metrics_suite(y_te, s_uni_te, threshold=thr_def)
     m_prior = binary_metrics_suite(y_te, s_prior_te, threshold=thr_def)
@@ -1455,6 +1547,26 @@ def run_layer2_evaluation(
         biz_rows.extend(metrics_at_fixed_thresholds(name, y_te, scores, biz_thrs))
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-class (A/B/C) pre- vs post-isotonic-calibration reliability diagrams for the primary
+    # ("conditioned") model -- reviewer feedback specifically named A-parts, given the paper's
+    # emphasis on calibration's operational value there.
+    crit_te = df_test["criticality_class"].astype(str).to_numpy()
+    calib_summary_rows: List[Dict[str, Any]] = []
+    for stratum in ["A", "B", "C"]:
+        drawn = plot_calibration_pre_post_by_class(
+            crit_te, y_te, s_cond_te, s_cond_te_calibrated, stratum,
+            out_dir / f"compliance_calibration_pre_post_{stratum}.png",
+        )
+        calib_summary_rows.append({"stratum": stratum, "plot_written": drawn})
+    for name, s_te in [("uniform", s_uni_te), ("prior", s_prior_te), ("conditioned", s_cond_te), ("oracle", s_orac_te)]:
+        brier_pre = float(brier_score_loss(y_te, s_te))
+        brier_post = float(brier_score_loss(y_te, calib[name]))
+        calib_summary_rows.append(
+            {"model": name, "brier_pre_calibration": brier_pre, "brier_post_isotonic": brier_post}
+        )
+    pd.DataFrame(calib_summary_rows).to_csv(out_dir / "compliance_calibration_summary.csv", index=False)
+
     pd.DataFrame(
         [
             {"model": "uniform", **m_uni},

@@ -28,8 +28,21 @@ These values were originally chosen via `scripts/tune_conditioning.py` so Layer 
 | `THRESHOLD_SEARCH_MIN` / `MAX` | **0.05** / **0.50** | Validation F1 tuning range (avoids ~0.005 “flag everything”) |
 | `BUSINESS_THRESHOLDS` | **0.10,0.15,0.20,0.25** | Fixed ops thresholds for PR tradeoff CSV |
 | `CRIT_PROB_SHARPEN` | **0.88** | Sharpens Layer 1 probs before Layer 2 (<1 = more decisive) |
-| `L2_NUM_LEAVES` | **127** | Layer 2 LightGBM capacity |
+| `L2_NUM_LEAVES` | **63** | Layer 2 LightGBM capacity (random-search winner, see below; was 127 before searching) |
+| `L2_LEARNING_RATE` | **0.0143** | Layer 2 LightGBM learning rate (random-search winner; was the un-searched default 0.05) |
 | `LAYER2_SCOPE` | **real_category_only** | Restrict Layer 2 (supplier/compliance) rows to parts with a genuine real DataCo category link (~100-120 of 3500 parts) rather than the full catalog, most of which (UCI-sourced parts) falls back to a random within-category supplier-proxy assignment — see `data_dictionary.md`'s `real_category_link` entry for the UCI/DataCo category-vocabulary mismatch this addresses. Set to `all` to reproduce the full-catalog (larger-N, category-fallback-included) run instead. |
+
+### Hyperparameter search (reviewer feedback item #4a)
+
+`LGBM_MULTICLASS_PARAMS`/`LGBM_BINARY_PARAMS` (Layer 1 tabular / Layer 2 LGBM) and the GAT's `hidden`/`embed_dim`/`dropout`/`lr`/`weight_decay` were previously hand-set constants with no documented search. `scripts/hyperparameter_search.py` runs a **random search** (fixed seed; chosen over grid search for coverage efficiency and over Bayesian optimization for simplicity/exact reproducibility) — full search space and procedure are in the script's docstring. Training-only cross-validation/val-split (test set never touched during search):
+
+| Model | Trials | Validation protocol | Winning score |
+|---|---|---|---|
+| Layer 1 tabular LGBM | 20 | Part-level 5-fold CV on train parts | cv_macro_f1 = 0.596 |
+| Layer 2 binary LGBM | 20 | Part-level 5-fold CV on train parts | cv_auc_pr = 0.234 |
+| GAT | 12 | 80/20 train-part fit/val split, 30-epoch proxy | val_macro_f1 = 0.571 |
+
+Winning configs are now the codebase defaults (`modeling_lib.py`'s `LGBM_MULTICLASS_PARAMS`/`LGBM_BINARY_PARAMS`/`GATClassifier`/`train_gat_classifier`). Full per-trial results: `outputs/modeling/hparam_search_{layer1_lgbm,layer2_lgbm,gat}.csv`; winning configs: `outputs/modeling/best_hparams.json`. Re-run: `uv run --group modeling python scripts/hyperparameter_search.py` (requires an existing `layer1_bundle.pkl` from a prior full run for the Layer 2 search step).
 
 ## One-command reproduction
 
@@ -60,7 +73,8 @@ Check `outputs/run_manifest.json` for the recorded generator settings.
 export LAYER1_FEATURES=clean
 export COMPLIANCE_GRAIN=part_month
 export CRIT_PROB_SHARPEN=0.88
-export L2_NUM_LEAVES=127
+export L2_NUM_LEAVES=63
+export L2_LEARNING_RATE=0.0143
 export N_PARTS=3500
 export LAYER2_SCOPE=real_category_only
 export OMP_NUM_THREADS=1
@@ -92,8 +106,12 @@ uv run --group dev --group modeling jupyter nbconvert \
 | `outputs/modeling/business_value_simulation.csv` | Net value vs threshold |
 | `outputs/modeling/modeling_manifest.json` | Layer 2 grain, sharpen, row counts |
 | `outputs/modeling/layer2_*.json` | Per-model detail + by-class metrics |
+| `outputs/modeling/compliance_calibration_pre_post_{A,B,C}.png` | Reliability diagrams, pre- vs post-isotonic-calibration, per true-criticality stratum (reviewer feedback item #5) |
+| `outputs/modeling/compliance_calibration_summary.csv` | Brier pre/post isotonic calibration per model; which stratum plots were drawn (thin-sample guard) |
 
 Bootstrap CIs are part-level cluster bootstraps (`n_boot=2000` default, override via `L2_BOOTSTRAP_N`), not row-level — rows sharing a `part_id` in the part-month panel aren't independent, so row-level resampling would understate variance. See `modeling_lib.bootstrap_part_level_metric_diff`.
+
+**Isotonic calibration** (`modeling_lib.fit_isotonic_calibration`): fit on the pooled OOF validation scores only (never on test scores), applied to test scores for reporting. At `LAYER2_SCOPE=real_category_only`, the A-stratum test set is ~4 parts × 24 months at an ~8% failure rate — too thin (commonly <20 rows or <3 events) for a stable reliability curve, so that plot is correctly skipped rather than drawn on noise; `compliance_calibration_summary.csv`'s `plot_written` column records this honestly instead of silently omitting the file. B and C strata have enough data. State this N limitation explicitly if reporting A-part calibration in the paper.
 
 ## What to report in the paper
 
