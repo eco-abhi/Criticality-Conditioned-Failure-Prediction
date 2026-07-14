@@ -951,6 +951,40 @@ def generate_compliance_outcomes(
     rng: np.random.Generator,
     target_rate: float,
 ) -> pd.DataFrame:
+    """
+    Calibrated logistic data-generating process for ``compliance_failure``.
+
+    Exact model (reviewer feedback: specify the exact logistic DGP used to calibrate the target
+    failure rate and per-class rates):
+
+        logit(P(failure)) = b0
+            - 0.55 * 1[criticality_class == A]
+            + 0.10 * 1[criticality_class == B]
+            + 0.35 * 1[criticality_class == C]
+            + 0.65 * supplier_at_risk_flag
+            + 0.90 * z(lead_time_cv)
+            + 0.25 * z(bom_criticality_propagation_score)
+            - 0.55 * z(otd_oem_measured)
+            + 0.45 * z(reschedule_burden_pp)
+
+        y ~ Bernoulli(sigmoid(logit(P(failure))))
+
+    where ``z(.)`` is the sample z-score (mean-centered, divided by sample std + 1e-6) computed on
+    ``supplier_panel``/``part_catalog``'s merged rows, and criticality_class enters as three
+    separate one-hot indicators (not a single reference-coded dummy) with their own coefficients --
+    i.e. this is intentionally NOT identified the way a standard dummy-coded regression would be;
+    the intercept b0 absorbs whatever constant is needed to hit ``target_rate``, so the three
+    crit_A/B/C coefficients are only interpretable relative to each other, not as deviations from
+    an implicit omitted baseline.
+
+    Calibration: b0 is found by bisection search (56 iterations, bracket [-30, 30]) so that
+    mean(sigmoid(xb + b0)) == target_rate (COMPLIANCE_FAILURE_RATE_TARGET = 0.08) to within the
+    tolerances asserted below. This is a monotonic root-find on a single scalar, not fit via MLE
+    against any real outcome data -- the beta coefficients themselves are fixed, hand-set constants
+    (not estimated), chosen to (a) give criticality class a directionally sensible effect (A safer
+    than C) and (b) keep per-feature contributions on comparable standardized scales. They are not
+    derived from a literature-reported effect size for any of these covariates.
+    """
     df = supplier_panel.merge(
         part_catalog[
             [
@@ -1137,6 +1171,15 @@ def write_data_dictionary(
         "`compliance_failure` is intentionally modeling a different, higher-frequency, lower-severity "
         "phenomenon (routine operational/quality/delivery compliance) than product-safety recalls, not "
         "attempting to replicate the recall rate itself. See `outputs/compliance_benchmark_cpsc.md`.\n"
+    )
+    lines.append(
+        "- Exact logistic data-generating process for `compliance_failure`: see the "
+        "`generate_compliance_outcomes` docstring in `generate_synthetic_datasets.py` for the full "
+        "equation, coefficients, and calibration procedure (bisection search on the intercept to "
+        "hit the target 8% rate; per-class rates are an emergent consequence of the fixed, "
+        "hand-set — not literature-fit or MLE-estimated — crit_A/B/C coefficients, not directly "
+        "targeted). `compliance_model_intercept` is exported per-row in `compliance_outcomes.csv` "
+        "for exact reproducibility of the calibrated model.\n"
     )
     lines.append(
         "- `real_category_link`: UCI Online Retail (household/gift SKUs) and DataCo (sporting "

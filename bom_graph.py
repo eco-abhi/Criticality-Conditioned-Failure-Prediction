@@ -204,7 +204,19 @@ def compute_bom_position_features(
     bom_out_degree                  : number of components this part directly consumes.
     bom_longest_downstream_path     : longest path from this node to any root assembly.
     bom_n_downstream_A_assemblies   : count of A-class nodes reachable downstream.
-    bom_criticality_propagation_score : weighted cascade exposure score.
+    bom_criticality_propagation_score : a **structural exposure heuristic**, not a probability or
+        a validated estimate of actual cascade/failure propagation. It is a forward topological
+        sum of ancestor weights (``cascade_score[successor] += cascade_score[node] + node_weight``
+        for every edge) -- i.e. an unnormalized, weighted count of "how much high-criticality mass
+        sits upstream of this node," analogous to a weighted reachability/centrality measure. It
+        implicitly treats upstream contributions as independently additive; this has NOT been
+        validated against any independent cascade-realization mechanism (there isn't one in this
+        codebase to validate against -- the score IS the definition, so testing it against itself
+        would be circular). Reviewer feedback flagged this ambiguity; resolved by reframing rather
+        than by fabricating a validation. Treat it as a monotonic risk-exposure covariate (used
+        exactly that way downstream, as one standardized feature among several in
+        ``generate_compliance_outcomes``'s logistic model, never as a probability on its own), not
+        as a calibrated cascade-failure probability.
     latent_by_part : optional latent scores; when set, cascade weights and the downstream
         ``bom_n_downstream_A_assemblies`` counter use **latent tertiles** (high-latent ≡ top third),
         not ABC labels, so BOM summaries are not pure functions of ``criticality_class``.
