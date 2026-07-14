@@ -825,14 +825,16 @@ def bootstrap_layer2_comparisons(
 ) -> pd.DataFrame:
     """
     Part-level bootstrap CIs for the three pairwise Layer 2 comparisons (conditioned vs uniform,
-    oracle vs uniform, oracle vs conditioned) across auc_pr, brier, and f1@0.5. ``scores`` maps
-    {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te}.
+    oracle vs uniform, oracle vs conditioned) across auc_roc, auc_pr, brier, and f1@0.5. ``scores``
+    maps {"uniform": s_uni_te, "conditioned": s_cond_te, "oracle": s_orac_te}.
 
-    Metric direction: higher auc_pr and f1 are better; LOWER brier is better, so a negative
-    point_diff for brier means the second model in the pair improved on the first (fewer errors).
+    Metric direction: higher auc_roc, auc_pr and f1 are better; LOWER brier is better, so a
+    negative point_diff for brier means the second model in the pair improved on the first (fewer
+    errors).
     """
     part_ids = df_test["part_id"].astype(str).to_numpy()
     metric_fns: Dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+        "auc_roc": lambda y, s: roc_auc_score(y, s),
         "auc_pr": lambda y, s: average_precision_score(y, s),
         "brier": lambda y, s: brier_score_loss(y, s),
         "f1_at_0.5": lambda y, s: f1_score(y, (np.asarray(s) >= 0.5).astype(int), zero_division=0),
@@ -1095,6 +1097,7 @@ def oof_layer1_gat_lgbm(
     n_splits: int = 5,
     gat_epochs_oof: int = 80,
     device: Optional[torch.device] = None,
+    random_state: int = 42,
 ) -> Tuple[np.ndarray, List[List[float]]]:
     """
     For each training part, out-of-fold multiclass probabilities from GAT+LGBM stack.
@@ -1104,7 +1107,7 @@ def oof_layer1_gat_lgbm(
     N = len(part_order)
     oof = np.zeros((N, 3), dtype=np.float64)
     y_tr = y_all[train_indices]
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     all_losses: List[List[float]] = []
     for fold_id, (rel_tr, rel_va) in enumerate(skf.split(np.zeros(len(train_indices)), y_tr)):
         print(f"Layer1 OOF fold {fold_id + 1}/{n_splits}")
@@ -1290,6 +1293,7 @@ def run_layer2_evaluation(
     test_crit_mat: np.ndarray,
     layer1_mode: str,
     out_dir: Path,
+    random_state: int = 43,
 ) -> Dict[str, Any]:
     """
     Train uniform / conditioned / oracle Layer 2 models; write CSV + JSON artifacts.
@@ -1329,7 +1333,7 @@ def run_layer2_evaluation(
     )
     min_class_count = int(np.bincount(y_part_present).min())
     n_splits = max(2, min(5, min_class_count))
-    skf_l2 = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=43)
+    skf_l2 = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     part_arr = df_train["part_id"].astype(str).to_numpy()
 
     spw = int((y_tr == 0).sum()) / max(int((y_tr == 1).sum()), 1)

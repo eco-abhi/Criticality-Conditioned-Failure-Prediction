@@ -47,7 +47,13 @@ def run_pipeline(
     skip_layer1: bool = False,
 ) -> dict:
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_modeling_core")
-    ml.set_seed(42)
+    # RUN_SEED (default 42, matching the frozen paper config) controls both the train/test split
+    # and model training stochasticity (GAT init, LightGBM random_state stays fixed via
+    # LGBM_*_PARAMS -- only the split and GAT vary here). Overriding it is how
+    # scripts/multi_seed_significance.py gets independent repeated runs for CI estimation across
+    # runs/seeds, not just bootstrap-resampling one run's test set.
+    run_seed = int(os.environ.get("RUN_SEED", "42"))
+    ml.set_seed(run_seed)
 
     df, part_catalog, G, _, _ = ml.load_and_prepare_data(outputs_dir)
     n_parts = len(part_catalog)
@@ -59,7 +65,7 @@ def run_pipeline(
     # Layer 1 (criticality classification) always trains/evaluates on the full part-level split
     # below (train_indices/test_indices, derived straight from part_catalog) — it doesn't depend
     # on a DataCo category link. Only the Layer 2 (supplier/compliance) panel rows are scoped.
-    train_parts, test_parts = ml.part_level_train_test_split(part_catalog)
+    train_parts, test_parts = ml.part_level_train_test_split(part_catalog, random_state=run_seed)
     df_train = ml.filter_layer2_scope(df[df["part_id"].isin(train_parts)].copy(), part_catalog)
     df_test = ml.filter_layer2_scope(df[df["part_id"].isin(test_parts)].copy(), part_catalog)
 
@@ -112,6 +118,7 @@ def run_pipeline(
             n_splits=oof_splits,
             gat_epochs_oof=gat_oof,
             device=device,
+            random_state=run_seed,
         )
         scaler_gat, gat_final, lgbm_stack, _, _ = ml.fit_final_layer1_gat_lgbm(
             part_order,
@@ -217,6 +224,7 @@ def run_pipeline(
         test_crit_mat,
         layer1_mode,
         out_dir,
+        random_state=run_seed + 1,
     )
     summary.update({k: v for k, v in l2.items() if k != "y_test" and k != "scores_test"})
     return summary
