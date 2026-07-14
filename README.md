@@ -98,4 +98,6 @@ Key outputs under `outputs/modeling/`: `classification_comparison.csv`, `full_re
 
 ## License / data use
 
-Respect the **DataCo** and **UCI** dataset terms when redistributing or publishing. This repository does not redistribute those CSVs; obtain them from the sources above.
+Code in this repository is licensed under the [MIT License](LICENSE).
+
+Respect the **DataCo** and **UCI** dataset terms when redistributing or publishing. This repository does not redistribute those CSVs; obtain them from the sources above. The MIT license above covers the code only, not any third-party data.
