@@ -81,6 +81,7 @@ def main() -> None:
     base["N_PARTS"] = str(args.n_parts)
     base["SYNTHETIC_GENERATOR_MODE"] = "latent"
     base["L2_NUM_LEAVES"] = "127"
+    base["LAYER2_SCOPE"] = "real_category_only"
 
     rows: list[dict] = []
 

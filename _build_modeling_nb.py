@@ -152,10 +152,14 @@ train_parts, test_parts = ml.part_level_train_test_split(part_catalog, test_size
 train_set, test_set = set(train_parts), set(test_parts)
 assert not train_set & test_set
 
-df_train = df[df["part_id"].isin(train_parts)].copy()
-df_test = df[df["part_id"].isin(test_parts)].copy()
+# Layer 1 (criticality classification) trains/evaluates on the full part-level split above
+# (train_indices/test_indices below) regardless of scope. Only the Layer 2 (supplier/compliance)
+# panel rows are scoped — see modeling_lib.get_layer2_scope for why (UCI/DataCo category mismatch).
+df_train = ml.filter_layer2_scope(df[df["part_id"].isin(train_parts)].copy(), part_catalog)
+df_test = ml.filter_layer2_scope(df[df["part_id"].isin(test_parts)].copy(), part_catalog)
+print("LAYER2_SCOPE:", ml.get_layer2_scope())
 print("Panel rows train/test/total:", len(df_train), len(df_test), len(df))
-print("Unique parts train/test:", df_train["part_id"].nunique(), df_test["part_id"].nunique())
+print("Unique parts train/test (Layer 2 scope):", df_train["part_id"].nunique(), df_test["part_id"].nunique())
 
 print("\nCriticality (part catalog, train):")
 print(part_catalog[part_catalog["part_id"].isin(train_parts)]["criticality_class"].value_counts())
@@ -164,8 +168,8 @@ print(part_catalog[part_catalog["part_id"].isin(test_parts)]["criticality_class"
 print("\nCompliance failure rate train:", df_train["compliance_failure"].mean())
 print("Compliance failure rate test:", df_test["compliance_failure"].mean())
 
-assert df_train["part_id"].nunique() == len(train_parts)
-assert df_test["part_id"].nunique() == len(test_parts)
+assert df_train["part_id"].nunique() <= len(train_parts)
+assert df_test["part_id"].nunique() <= len(test_parts)
 
 X_tab, y_part, _ = ml.build_part_arrays(part_catalog, part_order, LAYER1_FEATS)
 assert X_tab.shape == (N, len(LAYER1_FEATS))

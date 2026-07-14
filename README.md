@@ -74,7 +74,7 @@ uv sync --group modeling
 uv run python scripts/reproduce_paper.py
 ```
 
-Or run steps manually with defaults: **3500 parts**, **latent** generator (`LLN=0.45`, `LFN=1.05`), **`LAYER1_FEATURES=clean`**, **`COMPLIANCE_GRAIN=part_month`**, **`CRIT_PROB_SHARPEN=0.88`**.
+Or run steps manually with defaults: **3500 parts**, **latent** generator (`LLN=0.45`, `LFN=1.05`), **`LAYER1_FEATURES=clean`**, **`COMPLIANCE_GRAIN=part_month`**, **`CRIT_PROB_SHARPEN=0.88`**, **`LAYER2_SCOPE=real_category_only`** (Layer 2 restricted to the ~100-120 parts with a genuine real DataCo category link — see `data_dictionary.md`'s `real_category_link` entry).
 
 | Script / notebook | Role |
 |-------------------|------|

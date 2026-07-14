@@ -385,6 +385,43 @@ def get_compliance_grain() -> str:
     return g
 
 
+def get_layer2_scope() -> str:
+    """
+    Layer 2 part scope: ``all`` (default) or ``real_category_only``.
+
+    UCI Online Retail and DataCo do not share a category vocabulary (see
+    ``generate_synthetic_datasets.build_unified_part_catalog`` — a TF-IDF similarity check found
+    >50% of UCI products have zero real overlap with any DataCo category). Most UCI-sourced parts'
+    supplier-proxy link is therefore a random within-category fallback, not a genuine category
+    match. ``real_category_only`` restricts Layer 2 (supplier/compliance) rows to parts flagged
+    ``real_category_link=True`` in part_catalog.csv (~100-120 parts per run) for a fully-grounded,
+    smaller-N result. Set env ``LAYER2_SCOPE``.
+    """
+    s = os.environ.get("LAYER2_SCOPE", "all").strip().lower()
+    if s not in ("all", "real_category_only"):
+        raise ValueError(f"LAYER2_SCOPE must be 'all' or 'real_category_only', got {s!r}")
+    return s
+
+
+def filter_layer2_scope(df: pd.DataFrame, part_catalog: pd.DataFrame) -> pd.DataFrame:
+    """Apply ``get_layer2_scope()`` to a compliance panel keyed by ``part_id``."""
+    scope = get_layer2_scope()
+    if scope == "all":
+        return df
+    if "real_category_link" not in part_catalog.columns:
+        raise ValueError(
+            "LAYER2_SCOPE=real_category_only requires a 'real_category_link' column in "
+            "part_catalog.csv; regenerate data with the current generate_synthetic_datasets.py."
+        )
+    linked = set(
+        part_catalog.loc[part_catalog["real_category_link"].astype(bool), "part_id"].astype(str)
+    )
+    out = df[df["part_id"].astype(str).isin(linked)].copy()
+    if out.empty:
+        raise ValueError("LAYER2_SCOPE=real_category_only left zero rows; check part_catalog.csv.")
+    return out
+
+
 def aggregate_compliance_panel_to_part_level(df: pd.DataFrame) -> pd.DataFrame:
     """
     Collapse the compliance panel to one row per part.
@@ -1088,31 +1125,46 @@ def run_layer2_evaluation(
     y_tr = df_train["compliance_failure"].to_numpy(dtype=int)
     y_te = df_test["compliance_failure"].to_numpy(dtype=int)
 
-    val_parts = train_test_split(
-        np.asarray(train_parts),
-        test_size=0.2,
-        random_state=43,
-        stratify=part_catalog.set_index("part_id")
-        .loc[list(train_parts)]["criticality_class"]
-        .map(CRIT_MAP),
-    )[1]
+    # Genuine held-out fit/val split *within* train (fit_parts and val_parts are disjoint),
+    # via part_level_train_val_split -- also works when df_train has been scoped down (e.g.
+    # LAYER2_SCOPE=real_category_only) since it's derived from parts actually present in df_train,
+    # not the raw `train_parts` arg.
+    #
+    # NOTE: this replaces a prior bug where s_val was produced by scoring the SAME model used for
+    # s_te (fit on all of df_train) on a subset of its own training rows -- in-sample, not held
+    # out. That inflated threshold_validation_max_f1_report's validation F1 (it hit the ~1.0
+    # ceiling at LAYER2_SCOPE=real_category_only's smaller N, where a 127-leaf LightGBM can nearly
+    # memorize ~1.9k training rows). Now s_val comes from a model fit only on fit_mask rows.
+    train_parts_present = df_train["part_id"].astype(str).unique()
+    fit_parts, val_parts = part_level_train_val_split(
+        part_catalog, train_parts_present, val_fraction=0.2, random_state=43
+    )
+    fit_mask = df_train["part_id"].isin(fit_parts).to_numpy()
     val_mask = df_train["part_id"].isin(val_parts).to_numpy()
     y_val = y_tr[val_mask]
 
     spw = int((y_tr == 0).sum()) / max(int((y_tr == 1).sum()), 1)
     l2_params = _l2_classifier_params(spw)
 
-    def _fit_predict(df_tr: pd.DataFrame, df_te: pd.DataFrame, df_va: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def _fit_predict(df_tr: pd.DataFrame, df_te: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """s_te: production model, fit on all of df_tr, scored on held-out test parts (df_te).
+        s_val: a separate model, fit only on fit_mask rows (excluding val_mask rows), scored on
+        val_mask rows -- genuinely held out, unlike scoring the production model on its own train
+        data."""
         Xtr = df_tr[l2_cols].to_numpy(dtype=np.float64)
         Xte = df_te[l2_cols].to_numpy(dtype=np.float64)
-        Xva = df_va[l2_cols].to_numpy(dtype=np.float64)
         m = LGBMClassifier(objective="binary", **l2_params)
         m.fit(_lgbm_df(Xtr), y_tr)
-        return m.predict_proba(_lgbm_df(Xte))[:, 1], m.predict_proba(_lgbm_df(Xva))[:, 1]
+        s_te = m.predict_proba(_lgbm_df(Xte))[:, 1]
 
-    s_uni_te, s_uni_val = _fit_predict(df_tr_u, df_te_u, df_tr_u.iloc[val_mask])
-    s_cond_te, s_cond_val = _fit_predict(df_tr_f, df_te_f, df_tr_f.iloc[val_mask])
-    s_orac_te, s_orac_val = _fit_predict(df_tr_o, df_te_o, df_tr_o.iloc[val_mask])
+        m_val = LGBMClassifier(objective="binary", **l2_params)
+        m_val.fit(_lgbm_df(Xtr[fit_mask]), y_tr[fit_mask])
+        s_val = m_val.predict_proba(_lgbm_df(Xtr[val_mask]))[:, 1]
+        return s_te, s_val
+
+    s_uni_te, s_uni_val = _fit_predict(df_tr_u, df_te_u)
+    s_cond_te, s_cond_val = _fit_predict(df_tr_f, df_te_f)
+    s_orac_te, s_orac_val = _fit_predict(df_tr_o, df_te_o)
 
     thr_def = 0.5
     m_uni = binary_metrics_suite(y_te, s_uni_te, threshold=thr_def)

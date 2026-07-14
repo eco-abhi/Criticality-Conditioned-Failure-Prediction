@@ -29,6 +29,7 @@ These values were chosen so Layer 2 **conditioned** beats **uniform** on AUC-PR 
 | `BUSINESS_THRESHOLDS` | **0.10,0.15,0.20,0.25** | Fixed ops thresholds for PR tradeoff CSV |
 | `CRIT_PROB_SHARPEN` | **0.88** | Sharpens Layer 1 probs before Layer 2 (<1 = more decisive) |
 | `L2_NUM_LEAVES` | **127** | Layer 2 LightGBM capacity |
+| `LAYER2_SCOPE` | **real_category_only** | Restrict Layer 2 (supplier/compliance) rows to parts with a genuine real DataCo category link (~100-120 of 3500 parts) rather than the full catalog, most of which (UCI-sourced parts) falls back to a random within-category supplier-proxy assignment — see `data_dictionary.md`'s `real_category_link` entry for the UCI/DataCo category-vocabulary mismatch this addresses. Set to `all` to reproduce the full-catalog (larger-N, category-fallback-included) run instead. |
 
 ## One-command reproduction
 
@@ -61,6 +62,7 @@ export COMPLIANCE_GRAIN=part_month
 export CRIT_PROB_SHARPEN=0.88
 export L2_NUM_LEAVES=127
 export N_PARTS=3500
+export LAYER2_SCOPE=real_category_only
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
@@ -95,6 +97,7 @@ uv run --group dev --group modeling jupyter nbconvert \
 - **Layer 2:** AUC-PR and Brier at 0.5; conditioned vs uniform vs oracle.
 - **Caveat:** Conditioning gain is **modest**; oracle shows headroom if criticality were perfect.
 - **Do not** headline train-max-F1 on the full training panel (rare positives + threshold overfitting).
+- **N caveat:** with `LAYER2_SCOPE=real_category_only`, Layer 2 runs on the ~100-120 parts with a genuine real DataCo category link, not the full 3500-part catalog — report this N explicitly; it's a smaller but fully-grounded result, not a like-for-like comparison with a full-catalog run (`LAYER2_SCOPE=all`).
 
 ## Retuning (optional)
 

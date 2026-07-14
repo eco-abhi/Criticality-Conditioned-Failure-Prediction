@@ -103,13 +103,16 @@ STOCKOUT_RATE_BY_CLASS = {"A": 0.35, "B": 1.1, "C": 2.4}
 BOM_DEPTH_MIN, BOM_DEPTH_MAX = 3, 5
 BOM_FANOUT_MIN, BOM_FANOUT_MAX = 3, 8
 
-# Supplier risk augmentation — synthetic layer on top of observed OTD
+# Supplier-proxy at-risk share: bottom quantile by real DataCo OTD is flagged at-risk
+# (see build_monthly_supplier_panel — data-derived threshold, not a random draw).
 AT_RISK_SUPPLIER_SHARE = 0.15
 OTD_TARGET_HIGH = 0.985
 OTD_ESCALATION_THRESHOLD = 0.97
-OTD_AT_RISK_MEAN = 0.955
 
-# OEM vs supplier-reported OTD gap (“reschedule burden”), percentage points
+# Literature-anchored band for the OEM-vs-reported OTD gap ("reschedule burden"), percentage
+# points. build_supplier_otd_from_dataco computes this gap from two independently real DataCo
+# fields; these bounds are used only as a post-hoc plausibility check (run_eda benchmark chart),
+# not to generate the value.
 RESCHEDULE_BURDEN_PP_MIN, RESCHEDULE_BURDEN_PP_MAX = 4.0, 12.0
 
 # Monthly panel horizon
@@ -682,6 +685,19 @@ def build_unified_part_catalog(
     both = both.reset_index(drop=True)
     both["part_id"] = _assign_part_ids_with_collision_suffix(both["namespace"], both["dedup_key"])
 
+    # True iff product_category is a genuine real DataCo category (not the UCI_ONLINE_RETAIL
+    # placeholder or a category that only exists because a synthetic-padding row cloned one).
+    # UCI Online Retail (household/gift SKUs) and DataCo (sporting goods/apparel/electronics
+    # retailer) do not share a category vocabulary — a TF-IDF similarity check between UCI
+    # product descriptions and DataCo's real category product-name corpus found >50% of UCI
+    # products have zero real overlap with any DataCo category, and even top-scoring matches were
+    # frequently keyword coincidences, not genuine category matches. Supplier-panel /
+    # compliance-outcome analyses that need a *real* category link (not the random within-category
+    # fallback used for unmatched parts — see build_monthly_supplier_panel) should filter on this
+    # column; see modeling_lib.get_layer2_scope / filter_layer2_scope.
+    real_dataco_categories = set(dataco["product_category"].dropna().astype(str).unique())
+    both["real_category_link"] = both["product_category"].astype(str).isin(real_dataco_categories)
+
     if mode == "legacy":
         both = augment_literature_part_features(both, rng, feature_overlap=abc_feature_overlap)
     else:
@@ -748,9 +764,73 @@ def build_category_month_otd_baseline(dataco: pd.DataFrame) -> pd.DataFrame:
 
 
 def derive_supplier_id(dataco: pd.DataFrame) -> pd.DataFrame:
+    """Supplier-proxy entity from real DataCo operational fields.
+
+    DataCo has no literal supplier identifier. (market, product_category, shipping_mode) is the
+    finest real operational grouping available (639 distinct combinations, median 47 real order
+    lines each over the full 2015-01..2018-01 span) and is used as a documented proxy for
+    "supplier". Only the *identity* is a proxy; every OTD / at-risk / reschedule metric attached
+    to it downstream (see build_supplier_otd_from_dataco) is computed from real order lines.
+    """
     df = dataco.copy()
-    df["supplier_id"] = pd.util.hash_pandas_object(df[["market", "product_category"]].astype(str), index=False).astype(str)
+    df["supplier_id"] = pd.util.hash_pandas_object(
+        df[["market", "product_category", "shipping_mode"]].astype(str), index=False
+    ).astype(str)
     return df
+
+
+def build_supplier_otd_from_dataco(
+    dataco_w: pd.DataFrame,
+    shrink_k: float = 8.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Real, DataCo-derived monthly on-time-delivery rate for the supplier-proxy entity (see
+    ``derive_supplier_id``): ``otd_supplier_reported`` = mean(``on_time_delivery``), DataCo's own
+    real ``days_shipping_real`` vs ``days_shipment_scheduled`` columns.
+
+    Monthly cells with few real order lines are shrunk toward the supplier-proxy's full-period
+    real average via a precision-weighted blend (``n / (n + shrink_k)``) — this is smoothing over
+    real observations, not injected noise, so single-digit-line months don't dominate.
+
+    Note on a design choice we reverted: we initially tried treating DataCo's ``late_delivery_risk``
+    field (and a calendar-date recomputation of OTD) as an independent second real "OEM-measured"
+    lens, to derive ``reschedule_burden_pp`` as a genuine real gap. Both agree with
+    ``on_time_delivery`` on >97% of rows — ``late_delivery_risk`` is essentially a restatement of
+    DataCo's own ``Delivery Status`` column, and the calendar recomputation differs only by
+    date-truncation rounding. DataCo does not contain two genuinely independent OTD measurement
+    systems, so that gap would have been fake precision, not a real signal. See
+    ``build_monthly_supplier_panel`` for how the reschedule-burden gap is instead handled
+    (literature-anchored synthetic overlay, gated by the real at-risk flag).
+
+    Returns (monthly_panel, overall_by_supplier).
+    """
+    df = dataco_w.dropna(subset=["order_date", "market", "product_category", "shipping_mode"]).copy()
+    df["month"] = _month_period(df["order_date"])
+
+    overall = (
+        df.groupby("supplier_id", observed=True)
+        .agg(
+            otd_supplier_reported_all=("on_time_delivery", "mean"),
+            n_lines_all=("on_time_delivery", "size"),
+        )
+        .reset_index()
+    )
+
+    cell = (
+        df.groupby(["supplier_id", "month"], observed=True)
+        .agg(
+            otd_supplier_reported_cell=("on_time_delivery", "mean"),
+            n_lines=("on_time_delivery", "size"),
+        )
+        .reset_index()
+    )
+    cell = cell.merge(overall[["supplier_id", "otd_supplier_reported_all"]], on="supplier_id", how="left")
+
+    w = cell["n_lines"] / (cell["n_lines"] + shrink_k)
+    cell["otd_supplier_reported"] = w * cell["otd_supplier_reported_cell"] + (1.0 - w) * cell["otd_supplier_reported_all"]
+
+    monthly = cell[["supplier_id", "month", "otd_supplier_reported"]]
+    return monthly, overall
 
 
 def build_monthly_supplier_panel(
@@ -760,12 +840,22 @@ def build_monthly_supplier_panel(
     rng: np.random.Generator,
 ) -> pd.DataFrame:
     dataco_w = derive_supplier_id(dataco)
-    baseline = build_category_month_otd_baseline(dataco_w)
+    category_baseline = build_category_month_otd_baseline(dataco_w)
+    monthly_otd, overall = build_supplier_otd_from_dataco(dataco_w)
 
     suppliers = dataco_w[["supplier_id", "market", "product_category"]].drop_duplicates().reset_index(drop=True)
-    m = int(max(1, round(AT_RISK_SUPPLIER_SHARE * len(suppliers))))
-    at_risk = set(suppliers.sample(m, random_state=int(rng.integers(1_000_000)))["supplier_id"].tolist())
-    suppliers["supplier_at_risk_flag"] = suppliers["supplier_id"].map(lambda s: int(s in at_risk))
+    suppliers = suppliers.merge(overall[["supplier_id", "otd_supplier_reported_all"]], on="supplier_id", how="left")
+
+    # At-risk = bottom AT_RISK_SUPPLIER_SHARE of supplier-proxies by real full-period reported
+    # OTD — a data-derived threshold on real DataCo performance, not a random draw. Rank-based
+    # (not quantile+<=) because many thin supplier-proxy cells tie at 0.0/1.0 exactly, which would
+    # otherwise blow past the target share; ties at the cutoff are broken with rng, not by row order.
+    n_sup = len(suppliers)
+    k_at_risk = int(round(AT_RISK_SUPPLIER_SHARE * n_sup))
+    tiebreak = rng.random(n_sup)
+    order = np.lexsort((tiebreak, suppliers["otd_supplier_reported_all"].to_numpy()))
+    at_risk_idx = set(order[:k_at_risk].tolist())
+    suppliers["supplier_at_risk_flag"] = [int(i in at_risk_idx) for i in range(n_sup)]
 
     t0 = pd.Timestamp(dataco_w["order_date"].min()).to_period("M").to_timestamp()
     months = pd.date_range(t0, periods=n_months, freq="MS")
@@ -773,6 +863,10 @@ def build_monthly_supplier_panel(
     pc = part_catalog[["part_id", "product_category"]].copy()
     pc["product_category"] = pc["product_category"].astype(str)
 
+    # Necessary synthetic linkage: parts (from UCI/DataCo product-level stats) and supplier-proxies
+    # (from DataCo order-line operational groups) are not linked in the raw data, so one
+    # matching-category supplier-proxy is assigned per part at random. Everything about the
+    # assigned supplier-proxy's *behavior* below is real, not the assignment itself.
     j = pc.merge(suppliers, on="product_category", how="left")
     j["_rk"] = rng.random(len(j))
     j = j.sort_values(["part_id", "_rk"], kind="mergesort").drop_duplicates(subset=["part_id"], keep="first")
@@ -791,28 +885,47 @@ def build_monthly_supplier_panel(
     months_df = pd.DataFrame({"month": months})
     panel = j.merge(months_df, how="cross")
 
-    base = baseline.rename(columns={"otd_public": "otd_public_raw"})
+    # Coarser real reference (category x month), distinct from the finer supplier-proxy-grain
+    # metrics below.
+    base = category_baseline.rename(columns={"otd_public": "otd_public_raw"})
     panel = panel.merge(base, on=["product_category", "month"], how="left")
-    month_avg = baseline.groupby("month", observed=True)["otd_public"].mean()
+    month_avg = category_baseline.groupby("month", observed=True)["otd_public"].mean()
     panel["otd_public_dataco"] = panel["otd_public_raw"].astype(float)
     panel["otd_public_dataco"] = panel["otd_public_dataco"].fillna(panel["month"].map(month_avg))
     panel = panel.drop(columns=["otd_public_raw"], errors="ignore")
 
+    # Supplier-proxy-grain real OTD (shrunk monthly rate; see build_supplier_otd_from_dataco).
+    panel = panel.merge(monthly_otd, on=["supplier_id", "month"], how="left")
+    # Fallback for supplier-proxy x month cells outside the real DataCo horizon actually observed
+    # for that proxy: the supplier-proxy's own full-period real average (never injected noise).
+    ov = overall.set_index("supplier_id")
+    panel["otd_supplier_reported"] = panel["otd_supplier_reported"].fillna(
+        panel["supplier_id"].map(ov["otd_supplier_reported_all"])
+    )
+
+    # reschedule_burden_pp / otd_oem_measured: DataCo has no second, genuinely independent OTD
+    # measurement system (see build_supplier_otd_from_dataco docstring) to derive this "OEM audit
+    # vs supplier-reported" gap from real data. Kept as a literature-anchored synthetic overlay
+    # (RESCHEDULE_BURDEN_PP_MIN/MAX), but — unlike the original design — it is now *gated by the
+    # real at-risk flag* rather than independent random noise: at-risk supplier-proxies (real,
+    # bottom-quantile OTD) draw from the upper half of the literature band, others from the lower
+    # half, so the synthetic gap is at least conditioned on real supplier-proxy behavior.
     n = len(panel)
     risk = panel["supplier_at_risk_flag"].astype(bool).to_numpy()
-    stable_otd = np.clip(rng.normal(0.985, 0.008, size=n), 0.97, 0.999)
-    at_risk_otd = np.clip(rng.normal(0.955, 0.012, size=n), 0.70, 0.97)
-    otd_supplier = np.where(risk, at_risk_otd, stable_otd)
-    burden_pp = rng.uniform(RESCHEDULE_BURDEN_PP_MIN, RESCHEDULE_BURDEN_PP_MAX, size=n)
-    otd_oem = np.clip(otd_supplier - burden_pp / 100.0, 0.65, 0.999)
-
-    panel["otd_supplier_reported"] = otd_supplier
-    panel["otd_oem_measured"] = otd_oem
-    panel["reschedule_burden_pp"] = burden_pp
+    band_mid = RESCHEDULE_BURDEN_PP_MIN + 0.5 * (RESCHEDULE_BURDEN_PP_MAX - RESCHEDULE_BURDEN_PP_MIN)
+    low_band = rng.uniform(RESCHEDULE_BURDEN_PP_MIN, band_mid, size=n)
+    high_band = rng.uniform(band_mid, RESCHEDULE_BURDEN_PP_MAX, size=n)
+    panel["reschedule_burden_pp"] = np.where(risk, high_band, low_band)
+    panel["otd_oem_measured"] = np.clip(
+        panel["otd_supplier_reported"].astype(float) - panel["reschedule_burden_pp"] / 100.0, 0.0, 1.0
+    )
 
     assert panel["month"].nunique() == n_months
     assert int(panel.groupby("supplier_id")["supplier_at_risk_flag"].nunique().max()) == 1
     assert abs(float(panel["supplier_at_risk_flag"].mean()) - AT_RISK_SUPPLIER_SHARE) < 0.05
+    assert panel[["otd_supplier_reported", "otd_oem_measured", "reschedule_burden_pp"]].notna().all().all()
+    assert panel["otd_oem_measured"].between(0.0, 1.0).mean() > 0.98
+    assert (panel["reschedule_burden_pp"] >= 0.0).all()
 
     return panel
 
@@ -968,8 +1081,40 @@ def write_data_dictionary(
     lines.append("- UCI Online Retail: Chen et al. (2012), UCI ML Repository, https://doi.org/10.24432/C5BW3K.\n")
     lines.append("- Lead time uncertainty / CV bands: stochastic lead-time / supply uncertainty literature (Omega-style empirical studies; **synthetic** mapping in this notebook).\n")
     lines.append("- Automotive BOM depth / fan-out: CIRP Annals automotive assembly / BOM complexity literature (**synthetic graph**).\n")
-    lines.append("- Supplier OTD targets / escalation: APQC performance management + industry quality reporting (**anchors**); symestic-style OEM–supplier measured gaps (**synthetic reschedule burden**).\n")
+    lines.append("- Supplier OTD targets / escalation: APQC performance management + industry quality reporting (**anchors**).\n")
+    lines.append(
+        "- Supplier-proxy identity and OTD / at-risk flag: computed directly from real DataCo order-line "
+        "`on_time_delivery` (days_shipping_real vs days_shipment_scheduled), grouped by (market, category, "
+        "shipping mode) as a documented supplier-proxy entity — see `build_supplier_otd_from_dataco` "
+        "(**dataco_derived_proxy**: real behavior, proxy identity; DataCo has no literal supplier field, and "
+        "the part<->supplier-proxy assignment is a random within-category match). We evaluated using "
+        "DataCo's `late_delivery_risk` field as an independent second real OTD measure but found it >97% "
+        "redundant with `on_time_delivery` (a near-restatement of `Delivery Status`), so it is **not** used "
+        "as an independent signal.\n"
+    )
+    lines.append(
+        "- Reschedule burden / OEM-measured OTD gap: DataCo contains no second, genuinely independent OTD "
+        "measurement system, so this remains a **literature-anchored synthetic overlay** "
+        "(RESCHEDULE_BURDEN_PP_MIN/MAX) — but is now gated by the real at-risk flag above (at-risk "
+        "supplier-proxies draw from the upper half of the literature band) rather than independent random "
+        "noise.\n"
+    )
     lines.append("- Compliance rate band: operations management / quality performance benchmarking discourse (**calibrated synthetic outcome**).\n")
+    lines.append(
+        "- `real_category_link`: UCI Online Retail (household/gift SKUs) and DataCo (sporting "
+        "goods/apparel/electronics retailer) do not share a category vocabulary. A TF-IDF cosine "
+        "similarity check between UCI product descriptions and DataCo's real per-category product-name "
+        "corpus found 50% of UCI products have zero real overlap with any DataCo category, and only "
+        "5.1% clear a similarity >= 0.20 — with even top-scoring matches frequently reflecting keyword "
+        "coincidence rather than genuine category match (e.g. \"WHEELBARROW FOR CHILDREN\" top-matched "
+        "\"Children's Clothing\" at a perfect 1.000 score). We therefore did not build a similarity-based "
+        "category mapper. `real_category_link` (**public_or_dataco_derived**) flags the ~100-120 parts "
+        "per run whose `product_category` is a genuine real DataCo category; Layer 2 (supplier/compliance) "
+        "analyses can be scoped to this subset via `LAYER2_SCOPE=real_category_only` "
+        "(see `modeling_lib.get_layer2_scope`) for a fully-grounded, smaller-N result, distinct from the "
+        "full-catalog run which includes the random within-category supplier-proxy fallback for "
+        "unmatched (mostly UCI-sourced) parts.\n"
+    )
 
     def dump_df(name: str, df: pd.DataFrame) -> None:
         lines.append(f"\n## `{name}`\n")
@@ -987,9 +1132,25 @@ def write_data_dictionary(
             "public_backbone",
             "stock_code",
             "otd_public_dataco",
+            "real_category_link",
+        }
+        # Real DataCo order-line behavior attached to a documented supplier-proxy entity (market x
+        # category x shipping mode) — see build_supplier_otd_from_dataco. Identity/part-linkage is a
+        # proxy; otd_supplier_reported and the at-risk flag are computed from real DataCo columns, not
+        # injected noise. reschedule_burden_pp / otd_oem_measured remain a literature-anchored synthetic
+        # overlay gated by the real at-risk flag (see citations above) and are NOT in this set.
+        dataco_derived_proxy_cols = {
+            "supplier_id",
+            "supplier_at_risk_flag",
+            "otd_supplier_reported",
         }
         for c in df.columns:
-            src = "public_or_dataco_derived" if c in public_cols else "synthetic_or_derived"
+            if c in public_cols:
+                src = "public_or_dataco_derived"
+            elif c in dataco_derived_proxy_cols:
+                src = "dataco_derived_proxy"
+            else:
+                src = "synthetic_or_derived"
             lines.append(f"- **{c}**: {src}\n")
 
     dump_df("part_catalog.csv", part_catalog.drop(columns=[c for c in ["dedup_key"] if c in part_catalog.columns], errors="ignore"))

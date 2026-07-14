@@ -29,6 +29,7 @@ PAPER_ENV = {
     "CRIT_PROB_SHARPEN": "0.88",
     "L2_NUM_LEAVES": "127",
     "N_PARTS": "3500",
+    "LAYER2_SCOPE": "real_category_only",
 }
 
 
@@ -55,13 +56,17 @@ def run_pipeline(
         raise ValueError(f"part_catalog has {n_parts} parts but N_PARTS={n_expected}")
 
     layer1_feats = ml.get_layer1_classification_features(layer1_mode)
+    # Layer 1 (criticality classification) always trains/evaluates on the full part-level split
+    # below (train_indices/test_indices, derived straight from part_catalog) — it doesn't depend
+    # on a DataCo category link. Only the Layer 2 (supplier/compliance) panel rows are scoped.
     train_parts, test_parts = ml.part_level_train_test_split(part_catalog)
-    df_train = df[df["part_id"].isin(train_parts)].copy()
-    df_test = df[df["part_id"].isin(test_parts)].copy()
+    df_train = ml.filter_layer2_scope(df[df["part_id"].isin(train_parts)].copy(), part_catalog)
+    df_test = ml.filter_layer2_scope(df[df["part_id"].isin(test_parts)].copy(), part_catalog)
 
     print(
-        f"COMPLIANCE_GRAIN={ml.get_compliance_grain()} | "
+        f"COMPLIANCE_GRAIN={ml.get_compliance_grain()} | LAYER2_SCOPE={ml.get_layer2_scope()} | "
         f"train/test rows: {len(df_train)}/{len(df_test)} | "
+        f"train/test parts: {df_train['part_id'].nunique()}/{df_test['part_id'].nunique()} | "
         f"failure rate: {df_train['compliance_failure'].mean():.4f} / {df_test['compliance_failure'].mean():.4f}"
     )
 
@@ -133,8 +138,12 @@ def run_pipeline(
         with (out_dir / "layer1_bundle.pkl").open("wb") as f:
             pickle.dump(
                 {
-                    "train_crit_mat": train_crit_mat,
-                    "test_crit_mat": test_crit_mat,
+                    # Full per-part arrays (aligned to part_order), not pre-sliced to a
+                    # LAYER2_SCOPE -- so --skip-layer1 can re-slice for whatever scope is active
+                    # without retraining the GAT (30-90 min) just to compare LAYER2_SCOPE values.
+                    "part_order": list(part_order),
+                    "oof_probs": oof_probs,
+                    "final_probs_all": final_probs_all,
                     "layer1_f1_macro": summary["layer1_f1_macro"],
                 },
                 f,
@@ -142,9 +151,20 @@ def run_pipeline(
             )
     else:
         bundle = pickle.loads((out_dir / "layer1_bundle.pkl").read_bytes())
-        train_crit_mat = bundle["train_crit_mat"]
-        test_crit_mat = bundle["test_crit_mat"]
         summary["layer1_f1_macro"] = float(bundle.get("layer1_f1_macro", float("nan")))
+        if "oof_probs" not in bundle:
+            raise ValueError(
+                "layer1_bundle.pkl was written by an older version that only cached pre-sliced "
+                "crit-prob matrices for one LAYER2_SCOPE. Re-run once without --skip-layer1 to "
+                "regenerate a scope-independent bundle."
+            )
+        bundle_part_order = bundle["part_order"]
+        if bundle_part_order != list(part_order):
+            raise ValueError("layer1_bundle.pkl part_order doesn't match the current part_catalog.")
+        pi_train = df_train["part_id"].map(part_to_idx).to_numpy()
+        train_crit_mat = bundle["oof_probs"][pi_train]
+        pi_test = df_test["part_id"].map(part_to_idx).to_numpy()
+        test_crit_mat = bundle["final_probs_all"][pi_test]
 
     layer1_rows = [
         ml.classification_metrics_row("Baseline1_rule_price", b1),

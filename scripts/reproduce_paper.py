@@ -18,6 +18,7 @@ PAPER_ENV = {
     "CRIT_PROB_SHARPEN": "0.88",
     "L2_NUM_LEAVES": "127",
     "N_PARTS": "3500",
+    "LAYER2_SCOPE": "real_category_only",
 }
 
 
