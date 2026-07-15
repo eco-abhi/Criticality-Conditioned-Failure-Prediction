@@ -1567,6 +1567,45 @@ def run_layer2_evaluation(
         )
     pd.DataFrame(calib_summary_rows).to_csv(out_dir / "compliance_calibration_summary.csv", index=False)
 
+    # --- Paper supplement extraction (addition only, no modeling-logic change): raw pre/post-
+    # isotonic reliability-curve data (frac_pos/mean_pred per bin) for the primary ("conditioned")
+    # model, by true criticality class. Only summary Brier scores were previously saved
+    # (compliance_calibration_summary.csv above) -- the underlying curve data needed to
+    # regenerate a reliability diagram from the numbers (not just the rendered PNG) was not.
+    supplement_dir = out_dir.parent / "paper_supplement"
+    supplement_dir.mkdir(parents=True, exist_ok=True)
+    calibration_data: Dict[str, Any] = {}
+    for stratum in ["A", "B", "C"]:
+        m = crit_te == stratum
+        y_s = y_te[m]
+        if y_s.size < 20 or int(y_s.sum()) < 3:
+            calibration_data[stratum] = {
+                "n_obs": int(m.sum()), "n_events": int(y_s.sum()),
+                "note": f"Too few {stratum}-class test observations/events for a stable reliability curve (<20 rows or <3 events).",
+            }
+            continue
+        n_bins_eff = int(max(2, min(10, y_s.sum(), len(y_s) // 5)))
+        pre_true, pre_pred = calibration_curve(y_s, s_cond_te[m], n_bins=n_bins_eff, strategy="uniform")
+        post_true, post_pred = calibration_curve(y_s, s_cond_te_calibrated[m], n_bins=n_bins_eff, strategy="uniform")
+        calibration_data[stratum] = {
+            "n_obs": int(m.sum()), "n_events": int(y_s.sum()), "base_rate": float(y_s.mean()),
+            "pre_calibration": {"mean_pred": pre_pred.tolist(), "frac_pos": pre_true.tolist(),
+                                 "brier_score": float(brier_score_loss(y_s, s_cond_te[m]))},
+            "post_calibration": {"mean_pred": post_pred.tolist(), "frac_pos": post_true.tolist(),
+                                  "brier_score": float(brier_score_loss(y_s, s_cond_te_calibrated[m]))},
+        }
+    supplement_path = supplement_dir / "calibration_data.json"
+    existing_supplement = {}
+    if supplement_path.is_file():
+        existing_supplement = json.loads(supplement_path.read_text(encoding="utf-8"))
+    existing_supplement["synthetic"] = {
+        "model": "conditioned",
+        "note": "Isotonic regression fit on pooled OOF validation scores only, applied to test scores; never fit on test scores.",
+        "by_class": calibration_data,
+    }
+    supplement_path.write_text(json.dumps(existing_supplement, indent=2), encoding="utf-8")
+    print(f"[supplement] Saved calibration_data.json (synthetic block)")
+
     pd.DataFrame(
         [
             {"model": "uniform", **m_uni},

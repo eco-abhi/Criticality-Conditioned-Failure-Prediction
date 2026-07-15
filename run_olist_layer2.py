@@ -37,6 +37,9 @@ import pandas as pd
 import statsmodels.api as sm
 from lightgbm import LGBMClassifier
 from scipy import stats
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -371,6 +374,45 @@ def step5_layer2(df: pd.DataFrame, train_parts, test_parts, l1: dict) -> dict:
     ]
     result = {"models": models, "pairwise_significance_fdr": sig}
     ml.save_json(OUT / "layer2_results.json", result)
+
+    # Isotonic calibration for the "conditioned" model (not previously computed for Olist -- fit
+    # on the pooled OOF validation scores already computed above, applied to test scores; never
+    # fit on test scores). Additive: no LGBM retraining, reuses s_cond_val/s_cond_te in memory.
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(s_cond_val, y_tr)
+    s_cond_te_calibrated = iso.predict(s_cond_te)
+    crit_te_arr = df_test["criticality_class"].astype(str).to_numpy()
+    calibration_data: dict = {}
+    for stratum in ["A", "B", "C"]:
+        m = crit_te_arr == stratum
+        y_s = y_te[m]
+        if y_s.size < 20 or int(y_s.sum()) < 3:
+            calibration_data[stratum] = {
+                "n_obs": int(m.sum()), "n_events": int(y_s.sum()),
+                "note": f"Too few {stratum}-class test observations/events for a stable reliability curve (<20 rows or <3 events).",
+            }
+            continue
+        n_bins_eff = int(max(2, min(10, y_s.sum(), len(y_s) // 5)))
+        pre_true, pre_pred = calibration_curve(y_s, s_cond_te[m], n_bins=n_bins_eff, strategy="uniform")
+        post_true, post_pred = calibration_curve(y_s, s_cond_te_calibrated[m], n_bins=n_bins_eff, strategy="uniform")
+        calibration_data[stratum] = {
+            "n_obs": int(m.sum()), "n_events": int(y_s.sum()), "base_rate": float(y_s.mean()),
+            "pre_calibration": {"mean_pred": pre_pred.tolist(), "frac_pos": pre_true.tolist(),
+                                 "brier_score": float(brier_score_loss(y_s, s_cond_te[m]))},
+            "post_calibration": {"mean_pred": post_pred.tolist(), "frac_pos": post_true.tolist(),
+                                  "brier_score": float(brier_score_loss(y_s, s_cond_te_calibrated[m]))},
+        }
+    supplement_dir = ROOT / "outputs" / "paper_supplement"
+    supplement_dir.mkdir(parents=True, exist_ok=True)
+    supplement_path = supplement_dir / "calibration_data.json"
+    existing_supplement = json.loads(supplement_path.read_text(encoding="utf-8")) if supplement_path.is_file() else {}
+    existing_supplement["olist"] = {
+        "model": "conditioned",
+        "note": "Isotonic regression fit on pooled OOF validation scores only, applied to test scores; never fit on test scores. Second real domain (see run_olist_layer2.py docstring for scope/limitations).",
+        "by_class": calibration_data,
+    }
+    supplement_path.write_text(json.dumps(existing_supplement, indent=2), encoding="utf-8")
+    print("[supplement] Saved calibration_data.json (olist block)")
     return {"result": result, "df_train": df_train, "df_test": df_test, "y_tr": y_tr, "y_te": y_te,
             "s_cond_te": s_cond_te, "df_tr_cond": df_tr_cond, "df_te_cond": df_te_cond, "l2_cols": l2_cols}
 

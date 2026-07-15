@@ -121,7 +121,7 @@ def run_pipeline(
             device=device,
             random_state=run_seed,
         )
-        scaler_gat, gat_final, lgbm_stack, _, _ = ml.fit_final_layer1_gat_lgbm(
+        scaler_gat, gat_final, lgbm_stack, _, emb_full = ml.fit_final_layer1_gat_lgbm(
             part_order,
             X_tab,
             y_part,
@@ -138,6 +138,117 @@ def run_pipeline(
         l1_metrics = ml._multiclass_metrics_dict(y_part[test_indices], y_pred)
         ml.save_json(out_dir / "layer1_results.json", l1_metrics)
         summary["layer1_f1_macro"] = float(l1_metrics["f1_macro"])
+
+        # --- Paper supplement extraction (additions only, no modeling-logic changes): GAT
+        # attention weights and Layer 1 stacking-LGBM SHAP values. Neither gat_final nor
+        # lgbm_stack/emb_full are persisted anywhere else, so this only runs on a live
+        # (non---skip-layer1) retrain. Wrapped so a failure here can't take down the rest of the
+        # pipeline (Layer 2 evaluation still needs to run after this block).
+        supplement_dir = REPO / "outputs" / "paper_supplement"
+        supplement_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            gat_final.eval()
+            X_scaled_full = scaler_gat.transform(X_tab)
+            x_all_t = torch.tensor(X_scaled_full, dtype=torch.float32).to(device)
+            edge_index_dev = edge_index_full.to(device)
+            with torch.no_grad():
+                _, (edge_index_att, alpha) = gat_final.conv1(
+                    x_all_t, edge_index_dev, return_attention_weights=True
+                )
+            mean_alpha = alpha.mean(dim=1).cpu().numpy()
+            edge_index_np = edge_index_att.cpu().numpy()
+            id_to_class = part_catalog.set_index("part_id")["criticality_class"].to_dict()
+            src_classes = [id_to_class.get(part_order[i], "Unknown") for i in edge_index_np[0]]
+            dst_classes = [id_to_class.get(part_order[i], "Unknown") for i in edge_index_np[1]]
+            attention_data = {
+                "edge_src": edge_index_np[0].tolist(),
+                "edge_dst": edge_index_np[1].tolist(),
+                "mean_attention_weight": mean_alpha.tolist(),
+                "n_heads": int(alpha.shape[1]),
+                "n_edges": int(len(mean_alpha)),
+                "note": (
+                    "conv1 (first GATConv layer) attention, averaged across heads, from the final "
+                    "Layer 1 GAT model (full-fidelity retrain, canonical PAPER_ENV/RUN_SEED). "
+                    "Includes self-loop edges (add_self_loops=True in GATClassifier)."
+                ),
+            }
+            with (supplement_dir / "gat_attention_weights.json").open("w") as f:
+                json.dump(attention_data, f, indent=2)
+            print(f"[supplement] Saved attention weights: {len(mean_alpha)} edges")
+
+            df_att = pd.DataFrame({"src_class": src_classes, "dst_class": dst_classes, "attention": mean_alpha})
+            print("\n=== ATTENTION WEIGHTS BY DESTINATION CLASS ===")
+            print(df_att.groupby("dst_class")["attention"].describe().round(4))
+            att_summary = df_att.groupby("dst_class")["attention"].agg(["mean", "std", "median", "count"]).round(4)
+            att_summary.to_csv(supplement_dir / "attention_by_dst_class.csv")
+            print("[supplement] Saved attention_by_dst_class.csv")
+        except Exception as e:
+            print(f"[supplement] GAT attention extraction FAILED: {e}")
+
+        try:
+            X_scaled_full = scaler_gat.transform(X_tab)
+            X_lgb_te = np.hstack([X_scaled_full[test_indices], emb_full[test_indices]])
+            feature_names = list(layer1_feats) + [f"gat_emb_{i}" for i in range(emb_full.shape[1])]
+            # lgbm_stack was fit on ml._lgbm_df(...) column names (f0..fN, see
+            # fit_final_layer1_gat_lgbm) -- reuse the same helper for the SHAP input too, then
+            # remap to the real feature_names below for the saved/printed output.
+            X_te_df = ml._lgbm_df(X_lgb_te)
+            # Uses LightGBM's own native TreeSHAP (pred_contrib=True) rather than the `shap`
+            # package. Both the shap package's TreeExplainer (sklearn wrapper AND raw Booster) and
+            # LightGBM's own pred_contrib segfaulted (exit 139) on this platform when
+            # num_threads/n_jobs wasn't pinned to 1 -- reproduced in isolation and confirmed as an
+            # OpenMP threading race in LightGBM's native prediction path (n_jobs=1 in the
+            # constructor does not fully constrain it; num_threads=1 passed explicitly to
+            # .predict() does). Not a bug in this pipeline's modeling logic or data. pred_contrib
+            # computes the same TreeSHAP values as shap.TreeExplainer for tree models -- this is
+            # the documented equivalent, not an approximation.
+            n_feat = X_lgb_te.shape[1]
+            n_class = 3
+            contribs = lgbm_stack.booster_.predict(X_te_df, pred_contrib=True, num_threads=1)
+            reshaped = contribs.reshape(len(X_lgb_te), n_class, n_feat + 1)
+            per_class = [reshaped[:, k, :-1] for k in range(n_class)]  # drop bias/expected-value column
+
+            shap_summary: dict = {}
+            for i, cls in enumerate(["A", "B", "C"]):
+                if i >= len(per_class):
+                    continue
+                mean_abs = np.abs(per_class[i]).mean(axis=0)
+                ranked = sorted(zip(feature_names, mean_abs.tolist()), key=lambda x: -x[1])
+                shap_summary[f"class_{cls}"] = ranked[:15]
+            overall = np.mean([np.abs(sv).mean(axis=0) for sv in per_class], axis=0)
+            overall_ranked = sorted(zip(feature_names, overall.tolist()), key=lambda x: -x[1])
+            shap_summary["overall_top15"] = overall_ranked[:15]
+            shap_summary["_note"] = (
+                "TreeSHAP values (LightGBM native pred_contrib, num_threads=1) on the final "
+                "Layer 1 stacking LGBM (tabular + GAT-embedding features), scored on the test set "
+                "from a full-fidelity retrain (canonical PAPER_ENV/RUN_SEED)."
+            )
+            with (supplement_dir / "shap_layer1.json").open("w") as f:
+                json.dump(shap_summary, f, indent=2)
+            print("\n=== TOP 10 FEATURES BY MEAN |SHAP| (OVERALL) ===")
+            for feat, val in overall_ranked[:10]:
+                print(f"  {feat:<45} {val:.4f}")
+
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            names = [f for f, v in overall_ranked[:10]]
+            values = [v for f, v in overall_ranked[:10]]
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.barh(range(len(names)), values[::-1], color="#1A3557")
+            ax.set_yticks(range(len(names)))
+            ax.set_yticklabels(names[::-1], fontsize=9)
+            ax.set_xlabel("Mean |SHAP value|", fontsize=10)
+            ax.set_title("Layer 1 classification: top 10 features by SHAP importance", fontsize=10)
+            ax.spines[["top", "right"]].set_visible(False)
+            plt.tight_layout()
+            plt.savefig(supplement_dir / "shap_layer1_bar.png", dpi=180, bbox_inches="tight")
+            plt.close()
+            print("[supplement] Saved shap_layer1_bar.png")
+        except Exception as e:
+            print(f"[supplement] SHAP extraction FAILED: {e}")
 
         pi_train = df_train["part_id"].map(part_to_idx).to_numpy()
         train_crit_mat = oof_probs[pi_train]
